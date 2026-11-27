@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
 const (
@@ -34,6 +37,7 @@ const (
 // last refused a copy-video seek anchor at.
 type seekAnchorRefusalMark struct {
 	target     float64
+	unusable   bool
 	observedAt time.Time
 }
 
@@ -63,10 +67,11 @@ func seekAnchorRefusalKey(profileID string, requestedFileID int) string {
 	return profileID + "\x00" + strconv.Itoa(requestedFileID)
 }
 
-// record notes the target a retryable seek-anchor refusal was answered for.
-// The latest refusal wins: the retry card names one target, so an older one
-// must not be escalated by a later unrelated retry.
-func (t *seekAnchorRefusalTracker) record(key string, target float64) {
+// record notes the target a retryable seek-anchor refusal was answered for and
+// whether the probe resolved an unusable anchor. The latest refusal wins: the
+// retry card names one target, so an older one must not be escalated by a
+// later unrelated retry.
+func (t *seekAnchorRefusalTracker) record(key string, target float64, unusable bool) {
 	if t == nil || key == "" || target <= 0 {
 		return
 	}
@@ -87,32 +92,38 @@ func (t *seekAnchorRefusalTracker) record(key string, target float64) {
 			break
 		}
 	}
-	t.marks[key] = seekAnchorRefusalMark{target: target, observedAt: now}
+	t.marks[key] = seekAnchorRefusalMark{target: target, unusable: unusable, observedAt: now}
 }
 
 // take consumes the refusal for key when target is the position that was
-// refused. A consumed mark cannot escalate a second time: one refusal gets
-// one extended attempt, and a third start for the same target is an ordinary
-// first attempt again.
-func (t *seekAnchorRefusalTracker) take(key string, target float64) bool {
+// refused. A consumed mark cannot escalate a second time: one refusal gets one
+// extended attempt, and a third start for the same target is an ordinary first
+// attempt again. An unusable-anchor mark is not consumed: re-probing the same
+// target returns the same wrong keyframe however many attempts are granted, so
+// every start at that target keeps planning the decoded route until the window
+// lapses. It reports unusable=true for those marks.
+func (t *seekAnchorRefusalTracker) take(key string, target float64) (unusable bool, ok bool) {
 	if t == nil || key == "" || target <= 0 {
-		return false
+		return false, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entry, ok := t.marks[key]
 	if !ok {
-		return false
+		return false, false
 	}
 	if t.clock().Sub(entry.observedAt) >= seekAnchorRefusalWindow {
 		delete(t.marks, key)
-		return false
+		return false, false
 	}
 	if math.Abs(entry.target-target) > seekAnchorRefusalTargetTolerance {
-		return false
+		return false, false
+	}
+	if entry.unusable {
+		return true, true
 	}
 	delete(t.marks, key)
-	return true
+	return false, true
 }
 
 // seekAnchorRetryGrantV3 is the once-only permission a start carries when it
@@ -148,7 +159,10 @@ func seekAnchorRetryGrantFromContextV3(ctx context.Context) *seekAnchorRetryGran
 // refusal so the viewer's next start for the same requested file and target is
 // treated as the retry it is. Only the existing transcode_start_failed seek
 // card is recorded: other failures have their own remedies and must not
-// inherit this one.
+// inherit this one. An unusable anchor (a probe that ran and resolved a
+// keyframe far from the target) cannot be fixed by a longer probe, so it is
+// recorded separately: its retry plans a decoded, segment-seekable route
+// instead of repeating the same probe.
 func (h *PlaybackHandler) recordCopySeekAnchorRefusalV3(profileID string, requestedFileID int, target float64, failure *transportErrorV3) {
 	if h == nil || h.copySeekAnchorRefusals == nil {
 		return
@@ -156,25 +170,52 @@ func (h *PlaybackHandler) recordCopySeekAnchorRefusalV3(profileID string, reques
 	if failure == nil || !failure.retryable || !failure.seekFailure || failure.reason != transcodeStartFailedReasonV3 {
 		return
 	}
-	h.copySeekAnchorRefusals.record(seekAnchorRefusalKey(profileID, requestedFileID), target)
+	h.copySeekAnchorRefusals.record(seekAnchorRefusalKey(profileID, requestedFileID), target, errors.Is(failure.cause, playback.ErrCopySeekAnchorUnusable))
 }
 
-// copySeekAnchorRetryContextV3 turns a viewer's retry into a context grant for
-// prepareTransportTimelineV3. The retry is identified by the refusal this
-// handler just recorded: the same profile, requested file and target, matched
-// within the tolerance and consumed once. It deliberately does not require
-// force_relink. That flag asks the provider for a fresh pin, which is the last
-// thing a seek retry needs: the refused seek is on the source already playing,
-// and a forced provider re-query can fail in resolve before the anchor probe
-// this grant exists to extend. A fresh start at the refused target is the
-// retry, and the consumed mark keeps an unrelated later start from inheriting
-// it.
+// seekAnchorAvoidCopyContextKeyV3 marks a start whose copy-video seek cannot
+// anchor at its target and must plan a decoded route instead.
+type seekAnchorAvoidCopyContextKeyV3 struct{}
+
+func withSeekAnchorAvoidCopyV3(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, seekAnchorAvoidCopyContextKeyV3{}, true)
+}
+
+// seekAnchorAvoidsVideoCopyV3 reports whether this start was recognized as the
+// retry of an unusable-anchor refusal and must not plan a video copy.
+func seekAnchorAvoidsVideoCopyV3(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	avoid, _ := ctx.Value(seekAnchorAvoidCopyContextKeyV3{}).(bool)
+	return avoid
+}
+
+// copySeekAnchorRetryContextV3 turns a viewer's retry into the context that
+// makes it useful. The retry is identified by the refusal this handler just
+// recorded: the same profile, requested file and target, matched within the
+// tolerance. An extended probe window is granted only for a refusal a longer
+// probe can fix; an unusable anchor instead marks the start so it plans the
+// decoded route the forward-only copy transport cannot provide. It deliberately
+// does not require force_relink. That flag asks the provider for a fresh pin,
+// which is the last thing a seek retry needs: the refused seek is on the source
+// already playing, and a forced provider re-query can fail in resolve before
+// the anchor probe this grant exists to extend. A fresh start at the refused
+// target is the retry, and the consumed mark keeps an unrelated later start
+// from inheriting it.
 func (h *PlaybackHandler) copySeekAnchorRetryContextV3(ctx context.Context, profileID string, requestedFileID int, target float64) (context.Context, bool) {
 	if h == nil || h.copySeekAnchorRefusals == nil || target <= 0 {
 		return ctx, false
 	}
-	if !h.copySeekAnchorRefusals.take(seekAnchorRefusalKey(profileID, requestedFileID), target) {
+	unusable, ok := h.copySeekAnchorRefusals.take(seekAnchorRefusalKey(profileID, requestedFileID), target)
+	if !ok {
 		return ctx, false
+	}
+	if unusable {
+		return withSeekAnchorAvoidCopyV3(ctx), true
 	}
 	return withSeekAnchorRetryGrantV3(ctx, &seekAnchorRetryGrantV3{}), true
 }

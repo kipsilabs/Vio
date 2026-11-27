@@ -2374,6 +2374,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 		AudioTrackIndex:      audioIndex, Settings: settings,
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(),
 		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), InventoryProvenance: string(resolutionProvenance),
+		AvoidVideoCopy: seekAnchorAvoidsVideoCopyV3(r.Context()),
 	}
 	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), input)
 	var warnings []playback.DegradationWarningV3
@@ -2479,7 +2480,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 					if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
 						continue
 					}
-					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, LowerVersion: lowerVersionForFileV3(lowerVersion, candidateFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: subtitleInventoryFor(candidateFile), InventoryProvenance: string(candidateProvenance)})
+					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, LowerVersion: lowerVersionForFileV3(lowerVersion, candidateFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: subtitleInventoryFor(candidateFile), InventoryProvenance: string(candidateProvenance), AvoidVideoCopy: seekAnchorAvoidsVideoCopyV3(r.Context())})
 					// A retryable tone-map discovery failure converts to
 					// transcode_start_failed below; that verdict will not
 					// change for a sibling file, so stop here.
@@ -2524,7 +2525,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 				// subtitle, and every sibling that plays drops the subtitle
 				// too. Playing the requested file without it keeps its
 				// picture, when that plan can run.
-				if candidate := h.planWithoutSubtitleV3(r.Context(), playback.PlannerInputV3{Request: baseReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: baseAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)}); candidate != nil {
+				if candidate := h.planWithoutSubtitleV3(r.Context(), playback.PlannerInputV3{Request: baseReq, RequestedFile: requestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: baseAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), AvoidVideoCopy: seekAnchorAvoidsVideoCopyV3(r.Context())}); candidate != nil {
 					droppedSubtitle = candidate
 					subtitleNotShown = true
 				}
@@ -2562,6 +2563,7 @@ func (h *PlaybackHandler) planStartV3(r *http.Request, req playback.StartRequest
 						Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), subtitleMissFile), Now: time.Now(),
 						AdditionalSubtitles: subtitleInventoryFor(subtitleMissFile),
 						InventoryProvenance: string(subtitleMissProvenance),
+						AvoidVideoCopy:      seekAnchorAvoidsVideoCopyV3(r.Context()),
 					})
 					clampPlannerTargetResolution(&degradeResult, subtitleMissFile)
 					if degradeResult.Terminal == nil {
@@ -3045,6 +3047,7 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				logComponentKey, playbackLogValueV3,
 				"requested_file_id", requestedFile.ID,
 				"requested_seek_seconds", *req.StartPosition,
+				"avoid_video_copy", seekAnchorAvoidsVideoCopyV3(r.Context()),
 			)
 		}
 	}
@@ -3190,6 +3193,37 @@ func (h *PlaybackHandler) startPlaybackApplicationV3(r *http.Request, body []byt
 				"phase_budget_ms", virtualStartPhaseBudget.Milliseconds(),
 				"error", statusErr.cause)
 			return playback.DecisionResponseV3{}, startBudgetExhaustedOperationErrorV3()
+		}
+		// A copy-video seek whose probe resolved a keyframe far from the
+		// target cannot be fixed by retrying the same probe: the source
+		// answered the byte seek with its first keyframe. Plan the decoded HLS
+		// route at the same target instead, in this request. Its segment layer
+		// restarts FFmpeg at the target segment, so the seek lands instead of
+		// resetting the viewer to the start.
+		if errors.Is(statusErr.cause, playback.ErrCopySeekAnchorUnusable) && seekableCopyFallbackAppliesV3(result, req) {
+			fallback, fallbackWarnings := h.planSeekableCopyFallbackStartV3(r, req, requestedFile, alternateBase, effectiveFile, audioIndex, settings, lowerVersion, profileID, resolutionProvenance)
+			if fallback.result.Plan != nil && fallback.result.Terminal == nil {
+				req, effectiveFile, audioIndex = fallback.request, fallback.file, fallback.audioIndex
+				result = retryIncompleteToneMapPlanningV3(fallback.result, fallback.toneMapErr)
+				result = retryIncompletePlaybackSettingsV3(result, settingsErr)
+				appendStartWarningsV3(&result, fallbackWarnings)
+				slog.WarnContext(r.Context(), "copy-video seek anchor cannot describe the requested position; starting the decoded route instead",
+					logComponentKey, playbackLogValueV3,
+					"playback_attempt_id", req.PlaybackAttemptID,
+					"requested_file_id", requestedFile.ID,
+					"effective_file_id", effectiveFile.ID,
+					"requested_seek_seconds", *req.StartPosition,
+					"delivery", result.Plan.Delivery,
+					"error", statusErr.cause)
+				fallbackPhasesCtx, fallbackRecorder := withTransportPhaseTimingsV3(r.Context())
+				fallbackStartedAt := time.Now()
+				fallbackResponse, fallbackErr := h.startPlannedPlaybackV3(r.WithContext(fallbackPhasesCtx), userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, intent, result, clientInfo)
+				logTransportRetryPhasesV3(r.Context(), req.PlaybackAttemptID, fallbackStartedAt, fallbackRecorder)
+				if fallbackErr == nil {
+					return fallbackResponse, nil
+				}
+				statusErr = fallbackErr
+			}
 		}
 		// A decoder-rejected source is a candidate failure, not a route failure:
 		// rotate to the next provider release before any terminal. An explicit
@@ -4306,6 +4340,52 @@ func (d playbackStartRequestDigestsV3) matches(stored string) bool {
 	return stored == "" || stored == d.current || stored == d.legacy
 }
 
+// isCopyVideoDeliveryV3 reports a delivery whose video is copied from the
+// source rather than decoded. Those transports start at the source keyframe
+// FFmpeg's input seek used and cannot move past it without a reanchor.
+func isCopyVideoDeliveryV3(delivery playback.DeliveryV3) bool {
+	return delivery == playback.DeliveryRemuxProgressiveV3 || delivery == playback.DeliveryRemuxHLSV3
+}
+
+// seekableCopyFallbackAppliesV3 reports whether a failed start is a copy-video
+// seek whose anchor the resolver rejected. Only such a start has a target to
+// re-plan a seekable route for; an ordinary start failure keeps its own
+// recovery.
+func seekableCopyFallbackAppliesV3(result playback.PlannerResultV3, req playback.StartRequestV3) bool {
+	return req.StartPosition != nil && seekableCopyPlanFallbackAppliesV3(result.Plan, *req.StartPosition)
+}
+
+// seekableCopyPlanFallbackAppliesV3 is the plan form of the check above: the
+// running recipe copies video and the seek has a positive target.
+func seekableCopyPlanFallbackAppliesV3(plan *playback.PlanV3, position float64) bool {
+	return plan != nil && isCopyVideoDeliveryV3(plan.Delivery) && position > 0
+}
+
+// planSeekableCopyFallbackStartV3 re-plans a start whose copy-video seek anchor
+// could not describe the requested position as the decoded HLS route. The
+// decoded delivery's segment layer restarts FFmpeg at the target segment, so
+// the seek lands even though the source will not hand out a seekable copy
+// stream. The flag travels on the request context so every planner input
+// planStartV3 builds — including an alternate-version walk — stays decoded.
+func (h *PlaybackHandler) planSeekableCopyFallbackStartV3(
+	r *http.Request,
+	req playback.StartRequestV3,
+	requestedFile, alternateBase, effectiveFile *models.MediaFile,
+	audioIndex int,
+	settings playback.PlannerSettingsV3,
+	lowerVersion *playback.LowerVersionV3,
+	profileID string,
+	resolutionProvenance ProbeProvenance,
+) (alternateCandidateV3, []playback.DegradationWarningV3) {
+	return h.planStartV3(
+		r.WithContext(withSeekAnchorAvoidCopyV3(r.Context())),
+		req, requestedFile, alternateBase, effectiveFile, audioIndex,
+		settings, lowerVersion, profileID, resolutionProvenance,
+	)
+}
+
+// appendStartWarningsV3 records the warnings a start's plan must publish once
+// for this attempt, skipping ones the plan already carries.
 func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback.DegradationWarningV3) {
 	if result == nil || len(warnings) == 0 || result.Plan == nil {
 		return
@@ -5290,6 +5370,81 @@ func (h *PlaybackHandler) lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentit
 	return playback.LookupCachedCopySeekAnchor(ffmpegPath, sourceIdentity, requestedSeekSeconds, segmentDuration)
 }
 
+// probeCopySeekAnchorV3 resolves the keyframe FFmpeg's input seek will use for
+// a copy-video start and validates it against the requested position. The
+// check runs here as well as inside ResolveCopySeekAnchorForSource so a probe
+// seam installed by a test is held to the same bar: a test that returns the
+// file's first keyframe must be rejected exactly as a real upstream ignoring
+// the byte seek is.
+func (h *PlaybackHandler) probeCopySeekAnchorV3(ctx context.Context, ffmpegPath, sourceIdentity, inputPath string, requested float64) (float64, int, error) {
+	var (
+		seconds float64
+		segment int
+		err     error
+	)
+	if h != nil && h.copySeekAnchor != nil {
+		seconds, segment, err = h.copySeekAnchor(ctx, ffmpegPath, inputPath, requested, playback.DefaultSegmentDuration)
+	} else {
+		seconds, segment, err = playback.ResolveCopySeekAnchorForSource(ctx, ffmpegPath, sourceIdentity, inputPath, requested, playback.DefaultSegmentDuration)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if unusable := playback.CopySeekAnchorUnusableError(requested, seconds); unusable != nil {
+		return 0, 0, unusable
+	}
+	return seconds, segment, nil
+}
+
+// copySeekAnchorUnusableForSeekV3 probes the copy-video anchor a reanchoring
+// seek would publish and reports whether it cannot describe the target. It is
+// used before a frozen copy recipe is replayed so the seek can take the decoded
+// route in the same response. Only a virtual source with a live pinned
+// transport is probed early: that input is already open, so the check costs no
+// provider call and covers the production failure of an upstream that ignores
+// the byte seek. A source this early check does not probe still gets the
+// transport timeline's own probe and retry budgets, and an unusable anchor
+// there records the refusal that the viewer's retry start re-plans; the early
+// check must not add a second provider open or spend the probe budget the
+// timeline owns.
+func (h *PlaybackHandler) copySeekAnchorUnusableForSeekV3(ctx context.Context, session *playback.Session, file *models.MediaFile, requested float64) bool {
+	if h == nil || session == nil || file == nil || requested <= 0 || !isVirtualPlaybackFile(file) {
+		return false
+	}
+	live, ok := h.livePinnedAnchorInputV3(session, file)
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(live) == "" {
+		return false
+	}
+	ffmpegPath := h.playbackConfig().FFmpegPath
+	sourceIdentity := file.FilePath
+	if _, _, ok := h.lookupCachedCopySeekAnchorV3(ffmpegPath, sourceIdentity, requested, playback.DefaultSegmentDuration); ok {
+		// A proven cache hit was validated when it was stored, and lookup
+		// evicts anything that cannot describe this request.
+		return false
+	}
+	probeWindow := seekAnchorProgressiveProbeWindowV3()
+	if probeWindow <= 0 {
+		probeWindow = playback.CopySeekProbeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeWindow)
+	defer cancel()
+	_, _, err := h.probeCopySeekAnchorV3(probeCtx, ffmpegPath, sourceIdentity, live, requested)
+	if !errors.Is(err, playback.ErrCopySeekAnchorUnusable) {
+		// A probe that did not finish says nothing about the anchor; the
+		// transport timeline owns that verdict and its retry budget.
+		return false
+	}
+	slog.WarnContext(ctx, "copy-video seek cannot anchor at the requested position; planning the decoded route",
+		logComponentKey, playbackLogValueV3,
+		"playback_session_id", session.ID,
+		"requested_seek_seconds", requested,
+		"error", err)
+	return true
+}
+
 // copySeekAnchorFailureLevel reports how a failed copy-video seek-anchor resolve
 // is logged. A transient provider failure or the probe's own per-attempt budget
 // expiring is not evidence against the release: the enclosing start may retry the
@@ -5490,10 +5645,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				return nil
 			}
 			probeAnchor := func(probeCtx context.Context) (float64, int, error) {
-				if h.copySeekAnchor != nil {
-					return h.copySeekAnchor(probeCtx, ffmpegPath, anchorInput, requested, playback.DefaultSegmentDuration)
-				}
-				return playback.ResolveCopySeekAnchorForSource(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested, playback.DefaultSegmentDuration)
+				return h.probeCopySeekAnchorV3(probeCtx, ffmpegPath, sourceIdentity, anchorInput, requested)
 			}
 			// Virtual upstreams occasionally serve a range request slowly
 			// enough to blow the anchor budget. One bounded retry converts most
@@ -5738,6 +5890,14 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				indexBudgetElapsed = anchorBudgetElapsed
 				probeCancel()
 				recordVirtualProviderLinkLatency(linkKey, time.Since(attemptStarted), time.Now())
+				// An unusable anchor is a verdict, not a slow link: the probe
+				// ran and answered with a keyframe that cannot describe the
+				// target. Re-probing the same position spends another window to
+				// learn the same thing, so break immediately and let the seek
+				// take the decoded route.
+				if errors.Is(err, playback.ErrCopySeekAnchorUnusable) {
+					break
+				}
 				if err == nil || ctx.Err() != nil || attempt == 2 {
 					break
 				}
@@ -5811,7 +5971,7 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 					// could retry.
 					return preparedTimelineV3{}, resolveFailure
 				}
-				if seekRetry && progressiveSeek && ctx.Err() == nil {
+				if seekRetry && progressiveSeek && ctx.Err() == nil && !errors.Is(err, playback.ErrCopySeekAnchorUnusable) {
 					// The viewer already answered one refusal with Try again.
 					// Whether this attempt spent its extended window or failed
 					// for another anchor reason, answering the same retryable
@@ -5910,7 +6070,8 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 				// rotating the version or a replan tearing down the transport,
 				// and keep ERROR for a failure that is neither.
 				seekFailure := playback.IsTransientProviderError(err) ||
-					(anchorBudgetElapsed && ctx.Err() == nil)
+					(anchorBudgetElapsed && ctx.Err() == nil) ||
+					errors.Is(err, playback.ErrCopySeekAnchorUnusable)
 				slog.Log(ctx, copySeekAnchorFailureLevel(seekFailure),
 					"failed to resolve protocol v3 copy-video seek anchor",
 					"component", "api",
@@ -9949,6 +10110,11 @@ type replanPlanningV3 struct {
 	// audioInitFailureDetail names that failure so the planner can report the
 	// specific terminal when every route is exhausted.
 	audioInitFailureDetail string
+	// avoidVideoCopy forces this pass to plan a decoded HLS route. It is set
+	// only when a frozen copy-video seek recipe cannot resolve an anchor that
+	// describes the requested position, so the seek is served by the segment
+	// layer that can restart at the target.
+	avoidVideoCopy bool
 }
 
 // pinnedRenditionTracksV3 is the set of on-demand rendition tracks the
@@ -10042,7 +10208,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		// and the viewer can repeat the change.
 		return replanPassV3{}, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 	}
-	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+	result, toneMapCapabilityErr := h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: additional, AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start), AvoidVideoCopy: p.avoidVideoCopy})
 	if p.operation == playback.ReplanOperationOutputChangeV3 && result.Terminal != nil && effectiveFile.ID != p.currentEffectiveFile.ID {
 		// Returning to the requested edition is speculative during an output
 		// refresh. Any terminal from that probe must fall back to the edition
@@ -10056,7 +10222,7 @@ func (h *PlaybackHandler) planReplanV3(r *http.Request, p replanPlanningV3, star
 		if err != nil {
 			return replanPassV3{}, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 		}
-		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+		result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: p.plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail, CueIndexedSubtitleTracks: p.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start), AvoidVideoCopy: p.avoidVideoCopy})
 	}
 	planned := replanPassV3{alternateCandidateV3: alternateCandidateV3{file: effectiveFile, request: start, audioIndex: audioIndex, result: result, toneMapErr: toneMapCapabilityErr}, audioDegraded: audioDegraded}
 	if start.AllowsAlternateVersions() && terminalAllowsAlternateFileV3(result.Terminal) && replanAllowsAlternateFileV3(p.operation, start.QualityPreference) {
@@ -10132,7 +10298,7 @@ func (h *PlaybackHandler) planReplanAlternateV3(r *http.Request, p replanPlannin
 			if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
 				continue
 			}
-			candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateStart, RequestedFile: p.plannerRequestedFile, EffectiveFile: candidateFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, candidateFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile)})
+			candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateStart, RequestedFile: p.plannerRequestedFile, EffectiveFile: candidateFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, candidateFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: candidateAudioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile), AvoidVideoCopy: p.avoidVideoCopy})
 		}
 		if candidateResult.Terminal == nil && subtitleDropped {
 			// Prefer a version that keeps the viewer's subtitle; hold
@@ -10167,7 +10333,7 @@ func (h *PlaybackHandler) planReplanAlternateV3(r *http.Request, p replanPlannin
 		// subtitle, and every sibling that plays drops the subtitle
 		// too. Playing the effective file without it keeps its
 		// picture, when that plan can run.
-		if candidate := h.planWithoutSubtitleV3(r.Context(), playback.PlannerInputV3{Request: baseStart, RequestedFile: p.plannerRequestedFile, EffectiveFile: baseEffectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, baseEffectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: baseAudioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), baseEffectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), baseEffectiveFile)}); candidate != nil {
+		if candidate := h.planWithoutSubtitleV3(r.Context(), playback.PlannerInputV3{Request: baseStart, RequestedFile: p.plannerRequestedFile, EffectiveFile: baseEffectiveFile, LowerVersion: lowerVersionForFileV3(p.lowerVersion, baseEffectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: baseAudioIndex, Settings: p.settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), baseEffectiveFile), Now: time.Now(), AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), baseEffectiveFile), AvoidVideoCopy: p.avoidVideoCopy}); candidate != nil {
 			droppedSubtitle = candidate
 			subtitleNotShown = true
 		}
@@ -10204,6 +10370,7 @@ func (h *PlaybackHandler) replanInputV3(r *http.Request, p replanPlanningV3, sta
 		Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), file), Now: time.Now(),
 		AttemptedKeys: p.attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), file),
 		AudioShapeRetry: p.audioShapeRetry, AudioInitFailureDetail: p.audioInitFailureDetail,
+		AvoidVideoCopy: p.avoidVideoCopy,
 	}
 }
 
@@ -10369,6 +10536,12 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		operation = playback.ReplanOperationTrackChangeV3
 	}
 	seekReanchor := operation == playback.ReplanOperationSeekReanchorV3
+	// frozenSeekReanchor marks a seek that replays the session's durable recipe
+	// verbatim. A seek whose copy anchor cannot describe its target plans a
+	// fresh decoded route instead: it is still a seek (pinned to the mounted
+	// source, position applied to the session), but it is no longer a replay of
+	// the frozen recipe, so the recipe has to be frozen and validated afresh.
+	frozenSeekReanchor := seekReanchor
 	// seekNoMovement marks a frozen seek that resolves to the timeline the plan
 	// and the live session already serve. It suppresses the decision line so the
 	// entry point can answer it as an unchanged replan instead.
@@ -11009,23 +11182,90 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		audioInitFailureDetail: audioInitFailureDetail,
 	}
 	if seekReanchor { //nolint:nestif // executeReplanV3 exceeds Vio's nestif complexity-4 limit; refactor tracked separately
-		var frozenErr error
-		result, frozenErr = frozenSeekReanchorResultV3(record, req.PositionSeconds, time.Now())
-		if frozenErr != nil {
-			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
-				reason:    "seek_reanchor_recipe_unavailable",
-				message:   "The active playback recipe cannot be reopened; start a new playback attempt.",
-				retryable: true,
+		// A copy-video seek reanchor replays a frozen copy recipe, and that
+		// recipe can only start at the source keyframe FFmpeg's input seek
+		// actually used. Probe it before publishing the timeline: when the
+		// source answers the seek with its first keyframe (an upstream that
+		// ignores the byte seek), the copied stream's origin is far from the
+		// target and a forward-only copy transport cannot correct it. Plan the
+		// decoded HLS route for this seek instead; its segment layer restarts
+		// FFmpeg at the target segment, so the seek lands in this same
+		// response instead of resetting the viewer to the start.
+		if seekableCopyPlanFallbackAppliesV3(&record.CurrentPlan, req.PositionSeconds) {
+			liveSession, sessionErr := h.sessionMgr.GetSession(record.SessionID)
+			if sessionErr == nil && h.copySeekAnchorUnusableForSeekV3(r.Context(), liveSession, effectiveFile, req.PositionSeconds) {
+				// A seek replays a frozen recipe and never needed planner settings;
+				// the decoded fallback is a fresh plan, so resolve them now. Without
+				// them the planner sees transcoding disabled and cannot offer the
+				// route.
+				fallbackSettings, fallbackSettingsErr := h.plannerSettingsV3Result(r.Context())
+				if fallbackSettingsErr != nil {
+					plannerSettings, plannerSettingsErr = fallbackSettings, fallbackSettingsErr
+					slog.WarnContext(r.Context(), "copy-video seek anchor cannot describe the requested position; playback settings unavailable, keeping the recorded route",
+						logComponentKey, playbackLogValueV3,
+						"playback_session_id", record.SessionID,
+						"requested_seek_seconds", req.PositionSeconds,
+						"error", fallbackSettingsErr)
+				} else {
+					// A seek replays the durable plan's selection, so its audio
+					// index was never resolved for a fresh planner pass. The
+					// selected track travels on start; plan the same one.
+					fallbackAudioIndex, _, fallbackAudioErr := resolveV3AudioIndex(effectiveFile, start.AudioTrackID, start.AudioTrackIndex)
+					if fallbackAudioErr != nil {
+						return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: fallbackAudioErr.Error()}
+					}
+					plannerSettings = fallbackSettings
+					planning.settings = fallbackSettings
+					planning.avoidVideoCopy = true
+					audioIndex = fallbackAudioIndex
+					planning.attemptedKeys = append(slices.Clone(planning.attemptedKeys),
+						playback.PlanAttemptKeyV3(record.CurrentPlan, start.ClientPlaybackContext.Output.OutputContextID, nil))
+					planned, planErr := h.planReplanV3(r, planning, start, effectiveFile, audioIndex, audioDegraded)
+					if planErr != nil {
+						return playback.DecisionResponseV3{}, *record, nil, planErr
+					}
+					if planned.result.Plan != nil && planned.result.Terminal == nil {
+						previousDelivery := record.CurrentPlan.Delivery
+						start, effectiveFile, audioIndex = planned.request, planned.file, planned.audioIndex
+						result, toneMapCapabilityErr = planned.result, planned.toneMapErr
+						audioDegraded, subtitleNotShown = planned.audioDegraded, planned.subtitleNotShown
+						subtitleDegraded = subtitleDegraded || planned.subtitleDegraded
+						// The replacement is a fresh plan, not a replay of the durable
+						// recipe: freeze its identity like any other planned replan and
+						// let the normal delivery-change marker tell the client the
+						// serving route moved.
+						frozenSeekReanchor = false
+						slog.WarnContext(r.Context(), "copy-video seek anchor cannot describe the requested position; replanning the seek to the decoded route",
+							logComponentKey, playbackLogValueV3,
+							"playback_session_id", record.SessionID,
+							"requested_seek_seconds", req.PositionSeconds,
+							"previous_delivery", previousDelivery,
+							"delivery", result.Plan.Delivery,
+							"decision_reason", result.Plan.DecisionReason)
+					}
+				}
 			}
 		}
-		// A carried subtitle that no longer binds to the effective file is not
-		// a reason to refuse the position: drop it for this replan and keep
-		// moving. Only a recipe that cannot be replayed at all stays terminal.
-		if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
-			// The authoritative seek block below records the drop once; this
-			// pass only decides that the frozen recipe may be replayed without
-			// its subtitle.
-			seekSubtitleDegraded = true
+		if frozenSeekReanchor {
+			var frozenErr error
+			result, frozenErr = frozenSeekReanchorResultV3(record, req.PositionSeconds, time.Now())
+			if frozenErr != nil {
+				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
+					reason:    "seek_reanchor_recipe_unavailable",
+					message:   "The active playback recipe cannot be reopened; start a new playback attempt.",
+					retryable: true,
+				}
+			}
+			// A carried subtitle that no longer binds to the effective file is
+			// not a reason to refuse the position: drop it for this replan and
+			// keep moving. Only a recipe that cannot be replayed at all stays
+			// terminal.
+			if err := h.validateFrozenSubtitleIdentityV3(r.Context(), effectiveFile, record.FrozenRecipe); err != nil {
+				// The authoritative seek block below records the drop once; this
+				// pass only decides that the frozen recipe may be replayed without
+				// its subtitle.
+				seekSubtitleDegraded = true
+			}
 		}
 	} else if userIntentOperation || (virtualDecodeRotation && isVirtualPlaybackFile(currentEffectiveFile)) {
 		// A track/quality/output change replaces the plan with one built from
@@ -12017,7 +12257,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		// them to the plan once it is selected.
 		replanCapabilityWarnings = warnings
 		audioIndex = 0
-		if !seekReanchor {
+		if !frozenSeekReanchor {
 			if dropStaleAudioTrackIdentityV3(r.Context(), effectiveFile, start.AudioTrackID) {
 				start.AudioTrackID = ""
 				start.AudioTrackIndex = nil
@@ -12092,10 +12332,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				return trimmed == failedKey || trimmed == mutatedKey
 			})
 		}
-		if !seekReanchor {
+		if !frozenSeekReanchor {
 			plannerSettings, plannerSettingsErr = h.plannerSettingsV3Result(r.Context())
 		}
-		if seekReanchor {
+		if frozenSeekReanchor {
 			var frozenErr error
 			result, frozenErr = frozenSeekReanchorResultV3(record, req.PositionSeconds, time.Now())
 			if frozenErr != nil {
@@ -12143,7 +12383,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				// and the viewer can repeat the change.
 				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Downloaded subtitles are temporarily unavailable.", inventoryErr)
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: additional, ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: stickyDelivery, InventoryProvenance: string(replanVirtualProvenance), PreviousSubtitleEvaluation: previousSubtitleEvaluationV3(record), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start), AvoidVideoCopy: planning.avoidVideoCopy})
 			clampPlannerTargetResolution(&result, effectiveFile)
 			reportDetourSubtitleDrop()
 		}
@@ -12163,7 +12403,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			if err != nil {
 				return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: trackUnavailableReasonV3, message: err.Error()}
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start)})
+			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, LowerVersion: lowerVersionForFileV3(lowerVersion, effectiveFile), ServerBitrateCapKbps: serverBitrateCapV3(r.Context()), AudioTrackIndex: audioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile), ForceSoftwareVideoDecode: forceSoftwareDecode, DecodeAttemptDetail: decodeAttemptDetail, StickyDelivery: replanStickyDeliveryV3(operation, record.CurrentPlan.Delivery), AudioShapeRetry: audioShapeRetry, AudioInitFailureDetail: audioInitFailureDetail, CueIndexedSubtitleTracks: planning.renditionTracks.cueIndexedSubtitleTracks(effectiveFile, start), AvoidVideoCopy: planning.avoidVideoCopy})
 			clampPlannerTargetResolution(&result, effectiveFile)
 
 		}
@@ -12527,7 +12767,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		previousPlayMethod = session.PlayMethod
 	}
 	var deliveryChange *playback.DeliveryChangeV3
-	if !seekReanchor {
+	if !frozenSeekReanchor {
 		deliveryChange = deliveryChangeV3(record.CurrentPlan.Delivery, previousPlayMethod, result.Plan.Delivery, result.PlayMethod)
 	}
 	// The marker is scoped to the native v2 surface, like the deferred
@@ -12610,14 +12850,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	result.Plan.SessionID = session.ID
 	result.Plan.InventoryURL = "/api/v2/playback/" + session.ID + "/inventory"
 	artifactRecipe = record.FrozenRecipe
-	if seekReanchor && seekSubtitleDegraded {
+	if frozenSeekReanchor && seekSubtitleDegraded {
 		// Replay the same route with the subtitle selection cleared. Clearing
 		// the subtitle identity off the frozen recipe too is what stops later
 		// seeks from re-checking a selection this attempt already dropped, so
 		// the warning and its log line are recorded once, not once per seek.
 		artifactRecipe = degradeSeekReanchorSubtitleV3(record.FrozenRecipe, &result)
 	}
-	if !seekReanchor {
+	if !frozenSeekReanchor {
 		frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
 		if frozenErr != nil {
 			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to freeze the selected subtitle identity.", frozenErr)
@@ -12635,7 +12875,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// the feature beside WebVTT URLs.
 	artifactFeatures := replanSubtitleFeaturesV3(record, start.ClientFeatures)
 	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe, artifactFeatures); err != nil {
-		if !seekReanchor {
+		if !frozenSeekReanchor {
 			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
 		}
 		// The subtitle artifact itself is missing, moved, or unreadable. A seek
@@ -12668,7 +12908,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		start.SubtitleTrackID = ""
 		start.SubtitleTrackIndex = nil
 	}
-	if seekReanchor {
+	if frozenSeekReanchor {
 		// The route-identity guard proves the frozen route did not drift. A
 		// subtitle degrade is this replan's own, deliberate outcome, so compare
 		// against the same subtitles-off baseline on both sides: every other
@@ -12712,10 +12952,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// Direct play serves from the mounted source without a transcode session;
 	// an in-place seek reanchor stays on the same source by definition and keeps
 	// its transport URL (/stream/{sessionID}).
-	if seekReanchor && record.CurrentPlan.Delivery == playback.DeliveryOriginalHTTPV3 && result.Plan.Delivery == playback.DeliveryOriginalHTTPV3 {
+	if frozenSeekReanchor && record.CurrentPlan.Delivery == playback.DeliveryOriginalHTTPV3 && result.Plan.Delivery == playback.DeliveryOriginalHTTPV3 {
 		transportReused = true
 	} else if ((trackChange && len(unreachableNodes) == 0) ||
-		(seekReanchor && h.seekReanchorWithinActiveWindowV3(session, record.CurrentPlan, req.PositionSeconds))) &&
+		(frozenSeekReanchor && h.seekReanchorWithinActiveWindowV3(session, record.CurrentPlan, req.PositionSeconds))) &&
 		h.hasActiveReusableTransportV3(session, record.CurrentPlan.Delivery) {
 		proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
 		policy := h.playbackRoutingPolicyForContextV3(r.Context())
@@ -12869,7 +13109,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// that dropped its subtitle must rewrite the recipe even when the
 	// transport is reused, or the next seek re-validates the selection this
 	// attempt already dropped and warns again.
-	if !seekReanchor || !transportReused || seekSubtitleDegraded {
+	if !frozenSeekReanchor || !transportReused || seekSubtitleDegraded {
 		updated.FrozenRecipe = artifactRecipe
 	}
 	updated.NormalizedRequest = start

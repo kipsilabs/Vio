@@ -50,6 +50,7 @@ const (
 	decisionReasonAudioAdaptationV3        = "audio_adaptation"
 	hlsAudioAdaptationReasonV3             = "hls_audio_adaptation"
 	decisionReasonContainerNormalizationV3 = "container_normalization"
+	decisionReasonCopySeekAnchorUnusableV3 = "copy_seek_anchor_unusable"
 	audioLayoutMonoV3                      = "mono"
 	audioLayoutStereoV3                    = "stereo"
 	audioLayoutSurround51V3                = "5.1"
@@ -124,6 +125,14 @@ type PlannerInputV3 struct {
 	AdditionalSubtitles              []SubtitleInventoryEntryV3
 	ForceSoftwareVideoDecode         bool
 	DecodeAttemptDetail              string
+	// AvoidVideoCopy forces a decoded HLS route instead of a source-copying
+	// remux. It is set when the source cannot supply a copy-video keyframe that
+	// describes the requested position (an upstream that ignores the byte seek
+	// answers with the file's first keyframe). A forward-only copy transport
+	// cannot correct such an origin, so the seek is served by the decoded
+	// delivery, whose segment layer restarts at the target. A normal source
+	// keeps the copy route and pays nothing for this.
+	AvoidVideoCopy bool
 	// AudioShapeRetry rebuilds the current delivery's audio as a stereo AAC
 	// recipe after the client's audio output failed to initialize on a
 	// surround one. It is set only for the single bounded retry the handler
@@ -499,6 +508,16 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 			quality.BitrateKbps = min(quality.BitrateKbps, cap)
 		}
 	}
+	if input.AvoidVideoCopy {
+		// The copy route cannot seek to this request's position, so this
+		// attempt must decode. A source-preserving quality would hand the
+		// encoder the source's own bitrate, so replace it with the source-class
+		// ladder rung (the same treatment a burn-in force gets) and mark the
+		// transcode explicitly.
+		quality = forcedEncodeQualityResultV3(source, quality)
+		quality.RequiresTranscode = true
+		quality.PreservesSource = false
+	}
 	videoOK, videoEvidenceInsufficient := videoEligibleV3(source, input.Request)
 	var high10Quirk *AppliedQuirkV3
 	if !videoOK {
@@ -698,7 +717,7 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 	// rungs keep the existing terminals. A lower version that serves lower
 	// qualities can carry the reduction, so the planner refuses the source and
 	// the handler's alternate-version fallback transcodes that version instead.
-	if input.ServerBitrateCapKbps == 0 && quality.RequiresTranscode && !quality.ExplicitRung && (originalSubtitleOK || remuxSubtitleOK || hlsRemuxSubtitleOK) && videoOK &&
+	if !input.AvoidVideoCopy && input.ServerBitrateCapKbps == 0 && quality.RequiresTranscode && !quality.ExplicitRung && (originalSubtitleOK || remuxSubtitleOK || hlsRemuxSubtitleOK) && videoOK &&
 		(originalRangeOK || dvStripEligible || serverDV81Eligible || clientDV81Eligible || clientHDR10Eligible) &&
 		!videoTranscodeExecutableV3(input, source) && !lowerVersionServesQualitiesV3(input) {
 		warnings := append(quality.Warnings, DegradationWarningV3{
@@ -714,7 +733,13 @@ func planPlaybackOnceV3(input PlannerInputV3) (result PlannerResultV3) {
 		(!originalRangeOK && !dvStripEligible && !serverDV81Eligible && !clientDV81Eligible && !clientHDR10Eligible) ||
 		(!originalSubtitleOK && !remuxSubtitleOK && !hlsRemuxSubtitleOK) {
 		reasonOverride := ""
-		if !quality.RequiresTranscode && !videoOK && videoEvidenceInsufficient {
+		switch {
+		case input.AvoidVideoCopy:
+			// Name the reason the route decodes rather than copies, so the
+			// client can tell a seek-driven delivery change from a quality or
+			// compatibility one.
+			reasonOverride = decisionReasonCopySeekAnchorUnusableV3
+		case !quality.RequiresTranscode && !videoOK && videoEvidenceInsufficient:
 			// The only reason this route adapts is the evidence tier, not a
 			// negative device fact; name that in the decision and in any
 			// resulting terminal.

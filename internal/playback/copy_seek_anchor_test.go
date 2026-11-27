@@ -239,7 +239,144 @@ func TestResolveCopySeekAnchorMatchesRealLongGOPHEVC(t *testing.T) {
 	}
 }
 
-// resetCopySeekAnchorCache swaps in an isolated cache with an injectable clock
+// TestCopySeekAnchorUnusableErrorBoundsThePreRoll pins the plausibility bar a
+// resolved copy-video anchor must clear. A normal GOP of pre-roll is accepted,
+// including the 10 s long-GOP fixture; the production anchor that landed at the
+// file's first keyframe (3.667 s for a request at 118.757 s, a 115.09 s
+// pre-roll) is rejected, as is an anchor after the request or one whose clock
+// does not match the requested timeline.
+func TestCopySeekAnchorUnusableErrorBoundsThePreRoll(t *testing.T) {
+	cases := []struct {
+		name      string
+		requested float64
+		anchor    float64
+		want      bool
+	}{
+		{name: "bleach marker end 99 to 97.89", requested: 99, anchor: 97.89, want: false},
+		{name: "long-GOP HEVC 10s interval", requested: 18.261, anchor: 10, want: false},
+		{name: "exactly the pre-roll limit", requested: 130, anchor: 100, want: false},
+		{name: "one second past the limit", requested: 131, anchor: 100, want: true},
+		{name: "production first keyframe", requested: 118.75698324022346, anchor: 3.667, want: true},
+		{name: "anchor exactly on the request", requested: 120, anchor: 120, want: false},
+		{name: "anchor within rounding tolerance", requested: 120, anchor: 120.2, want: false},
+		{name: "anchor after the request", requested: 120, anchor: 121, want: true},
+		{name: "no seek", requested: 0, anchor: 0, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CopySeekAnchorUnusableError(tc.requested, tc.anchor)
+			if got := err != nil; got != tc.want {
+				t.Fatalf("unusable(%v, %v) = %v, want rejected=%v", tc.requested, tc.anchor, err, tc.want)
+			}
+			if err != nil && !errors.Is(err, ErrCopySeekAnchorUnusable) {
+				t.Fatalf("rejection does not wrap ErrCopySeekAnchorUnusable: %v", err)
+			}
+		})
+	}
+}
+
+// TestResolveCopySeekAnchorRejectedAnchorIsNotCached proves a probe that
+// resolves the file's first keyframe for a request far later is rejected and
+// never recorded as a proven interval. The next seek at the same target must
+// probe again (no cache reuse), and the lazy lookup the timeline uses must miss.
+func TestResolveCopySeekAnchorRejectedAnchorIsNotCached(t *testing.T) {
+	var calls int
+	cache := resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, _ int) (float64, int, error) {
+		calls++
+		return 3.667, 1, nil
+	})
+	const identity = "virtual://movie/first-keyframe"
+	ctx := context.Background()
+
+	_, _, err := ResolveCopySeekAnchorForSource(ctx, "ffmpeg", identity, "http://relay/first", 118.75698324022346, 2)
+	if !errors.Is(err, ErrCopySeekAnchorUnusable) {
+		t.Fatalf("first probe error = %v, want ErrCopySeekAnchorUnusable", err)
+	}
+	if len(cache.entries) != 0 {
+		t.Fatalf("cache entries = %d, want 0 (a rejected anchor must never be stored)", len(cache.entries))
+	}
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", identity, 115, 2); ok {
+		t.Fatal("the lazy lookup served a rejected anchor")
+	}
+
+	// A second seek to the same target re-probes rather than reusing a
+	// rejected anchor, and is rejected the same way.
+	_, _, err = ResolveCopySeekAnchorForSource(ctx, "ffmpeg", identity, "http://relay/first", 118.75698324022346, 2)
+	if !errors.Is(err, ErrCopySeekAnchorUnusable) {
+		t.Fatalf("second probe error = %v, want ErrCopySeekAnchorUnusable", err)
+	}
+	if calls != 2 {
+		t.Fatalf("probe calls = %d, want 2 (a rejected anchor must not be reused)", calls)
+	}
+	if len(cache.entries) != 0 {
+		t.Fatalf("cache entries after the second seek = %d, want 0", len(cache.entries))
+	}
+}
+
+// TestCopySeekAnchorCacheEvictsAnUnusableEntry proves a cached entry written by
+// an older binary (or injected by a caller) cannot outlive the new bar: lookup
+// drops it instead of serving it, so the next seek probes for its own anchor.
+func TestCopySeekAnchorCacheEvictsAnUnusableEntry(t *testing.T) {
+	var calls int
+	cache := resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		return requested - 1, int((requested - 1) / float64(segmentDuration)), nil
+	})
+	const identity = "virtual://movie/stale-entry"
+	sourceKey := copySeekAnchorSourceKey(ResolveFFmpegPath("ffmpeg"), identity, 2)
+	cache.mu.Lock()
+	cache.entries[copySeekAnchorGOPKey(sourceKey, 3.667)] = copySeekAnchorCacheEntry{
+		anchor:       copySeekAnchor{seconds: 3.667, segment: 1},
+		maxRequested: 118.75698324022346,
+		expiresAt:    time.Now().Add(time.Minute),
+	}
+	cache.mu.Unlock()
+
+	if _, _, ok := LookupCachedCopySeekAnchor("ffmpeg", identity, 100, 2); ok {
+		t.Fatal("lookup served a cached anchor that cannot describe the request")
+	}
+	cache.mu.Lock()
+	remaining := len(cache.entries)
+	cache.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("cache entries = %d, want the unusable entry evicted", remaining)
+	}
+
+	anchor, _, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", identity, "http://relay/stale", 100, 2)
+	if err != nil {
+		t.Fatalf("resolve after eviction: %v", err)
+	}
+	if anchor != 99 || calls != 1 {
+		t.Fatalf("anchor = %v calls = %d, want a fresh probe resolving 99", anchor, calls)
+	}
+}
+
+// TestResolveCopySeekAnchorAcceptsAnchorWithinPreRoll is the control: the
+// measured Bleach marker-end seek (99 s to 97.89 s, a 1.11 s pre-roll) is still
+// accepted and cached, so the normal case keeps planning the copy route and
+// pays for no extra probe.
+func TestResolveCopySeekAnchorAcceptsAnchorWithinPreRoll(t *testing.T) {
+	var calls int
+	resetCopySeekAnchorCache(t, nil, func(_ context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		calls++
+		return requested - 1.11, int((requested - 1.11) / float64(segmentDuration)), nil
+	})
+	anchor, segment, err := ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/bleach-marker", "http://relay/bleach", 99, 2)
+	if err != nil {
+		t.Fatalf("in-pre-roll anchor rejected: %v", err)
+	}
+	if math.Abs(anchor-97.89) > 0.001 || segment != 48 {
+		t.Fatalf("anchor = %v segment = %d, want 97.89, 48", anchor, segment)
+	}
+	anchor, _, err = ResolveCopySeekAnchorForSource(context.Background(), "ffmpeg", "virtual://movie/bleach-marker", "http://relay/bleach", 99, 2)
+	if err != nil || math.Abs(anchor-97.89) > 0.001 {
+		t.Fatalf("cached in-pre-roll anchor = %v err=%v, want 97.89", anchor, err)
+	}
+	if calls != 1 {
+		t.Fatalf("probe calls = %d, want 1 (an accepted anchor is cached)", calls)
+	}
+}
+
 // and probe runner, restoring the process-wide cache when the test ends. The
 // probe-cost tracker is reset with it, on the same clock, so one test's measured
 // probe need never sizes another test's budget.
@@ -1178,6 +1315,12 @@ func TestResolveCopySeekAnchorProbeTimeoutIsNotTransientProvider(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
+	// The caller returns at its budget while the probe's own closure is still
+	// reaping the killed process; join that flight before the test ends so the
+	// closure cannot outlive the process-wide cache this test reads.
+	t.Cleanup(func() {
+		awaitCopySeekProbeFlight(t, copySeekAnchorFlightKey(context.Background(), copySeekAnchorSourceKey(ResolveFFmpegPath(ffmpegPath), "/media/probe-timeout.mkv", 2), 120))
+	})
 	_, _, err := ResolveCopySeekAnchor(ctx, ffmpegPath, "/media/probe-timeout.mkv", 120, 2)
 	if err == nil {
 		t.Fatal("a timed-out probe resolved an anchor")

@@ -43,6 +43,28 @@ const (
 	// pays the provider open plus the byte seek plus the frame read, so twice
 	// the observed cost covers the same work on a link that is no slower.
 	copySeekAnchorProbeLatencyScale = 2
+
+	// MaxCopySeekPreRollSeconds is the farthest a resolved copy-video anchor may
+	// sit before the requested position and still describe that position's GOP.
+	// The normal pre-roll is the source's own keyframe interval: a 2 s broadcast
+	// interval or the 10 s long-GOP fixture the resolver is tested against.
+	// HLS packaging guidance keeps keyframe intervals at or under 6 s, so 30 s
+	// is already five times the recommended ceiling and three times the longest
+	// interval this server probes. Anything beyond it is not a GOP of the
+	// requested position: it is the file's first keyframe, which is what a
+	// source that ignored the byte seek returns (production: a seek to
+	// 118.757 s resolved 3.667 s, a 115.09 s pre-roll). Such an anchor is
+	// rejected rather than published as a timeline origin, because a
+	// forward-only copy transport cannot seek past it and the client settles on
+	// the file's first frames.
+	MaxCopySeekPreRollSeconds = 30.0
+	// copySeekAnchorPostRollTolerance is how far after the requested position a
+	// first copied packet may sit before the anchor is treated as the wrong
+	// packet. FFmpeg's input seek selects the keyframe at or before the
+	// request, so only timestamp rounding separates the two; a larger forward
+	// gap means the resolver observed a packet the transport will not start
+	// from.
+	copySeekAnchorPostRollTolerance = 0.25
 )
 
 var (
@@ -81,6 +103,37 @@ var ErrTransientProvider = errors.New("transient provider error")
 // candidate.
 func IsTransientProviderError(err error) bool {
 	return errors.Is(err, ErrTransientProvider)
+}
+
+// ErrCopySeekAnchorUnusable marks a probe that ran and returned a keyframe which
+// cannot describe the requested position. It is a verdict about the seek, not
+// about the provider or the release: an upstream that ignores a byte seek
+// answers with the file's first keyframe, and a retry that re-probes the same
+// target only spends the caller's budget again. Callers fall back to a decoded,
+// segment-seekable route instead of retrying or publishing the wrong origin.
+var ErrCopySeekAnchorUnusable = errors.New("copy seek anchor cannot describe the requested position")
+
+// CopySeekAnchorUnusableError returns nil when anchorSeconds is a plausible
+// copy-video keyframe for requestedSeekSeconds, or an error wrapping
+// ErrCopySeekAnchorUnusable explaining the gap. The usable window is the
+// requested position itself (allowing timestamp rounding) back to
+// MaxCopySeekPreRollSeconds of pre-roll. The comparison is against the client's
+// requested position, which is the timeline the published plan describes; an
+// anchor in a different clock domain (a source PTS rebased onto the file start)
+// fails it exactly as an ignored seek does.
+func CopySeekAnchorUnusableError(requestedSeekSeconds, anchorSeconds float64) error {
+	if requestedSeekSeconds <= 0 {
+		return nil
+	}
+	if anchorSeconds > requestedSeekSeconds+copySeekAnchorPostRollTolerance {
+		return fmt.Errorf("%w: requested %.3fs, anchor %.3fs is %.3fs after the request",
+			ErrCopySeekAnchorUnusable, requestedSeekSeconds, anchorSeconds, anchorSeconds-requestedSeekSeconds)
+	}
+	if preRoll := requestedSeekSeconds - anchorSeconds; preRoll > MaxCopySeekPreRollSeconds {
+		return fmt.Errorf("%w: requested %.3fs, anchor %.3fs is %.3fs before the request (limit %.0fs)",
+			ErrCopySeekAnchorUnusable, requestedSeekSeconds, anchorSeconds, preRoll, MaxCopySeekPreRollSeconds)
+	}
+	return nil
 }
 
 // upstream5xxMarkers are the ffmpeg stderr fragments that mean the upstream
@@ -270,6 +323,14 @@ func (c *copySeekAnchorCache) lookup(sourceKey string, requested float64) (copyS
 		if entry.anchor.seconds > requested {
 			continue
 		}
+		// An anchor that cannot describe this request is not evidence for it.
+		// Entries are validated before they are stored, but the guard also
+		// evicts one written by an older binary or injected by a test, so a
+		// rejected anchor can never be served as a proven interval.
+		if CopySeekAnchorUnusableError(requested, entry.anchor.seconds) != nil {
+			delete(c.entries, key)
+			continue
+		}
 		if !found || entry.anchor.seconds > best.anchor.seconds {
 			best, found = entry, true
 		}
@@ -298,6 +359,12 @@ func (c *copySeekAnchorCache) lookup(sourceKey string, requested float64) (copyS
 // exactly on the anchor keyframe stays unproven (Matroska pre-roll).
 func (c *copySeekAnchorCache) store(sourceKey string, requested float64, anchor copySeekAnchor) {
 	if c == nil || sourceKey == "" {
+		return
+	}
+	// A rejected anchor is never recorded: storing it would let the next seek
+	// into the claimed interval reuse it as if a probe had proven it, which is
+	// how one ignored seek became every following seek's origin.
+	if CopySeekAnchorUnusableError(requested, anchor.seconds) != nil {
 		return
 	}
 	c.mu.Lock()
@@ -591,7 +658,8 @@ func ResolveCopySeekAnchorForSource(
 
 	// Fast path: a previous probe already proved this position resolves to its
 	// keyframe. This is what turns a repeat or nearby seek into a zero-probe
-	// start.
+	// start. A cached anchor that cannot describe this request is a miss, never
+	// a silent reuse (see lookup).
 	if anchor, ok := copySeekAnchors.lookup(sourceKey, requestedSeekSeconds); ok {
 		return anchor.seconds, anchor.segment, nil
 	}
@@ -646,6 +714,22 @@ func ResolveCopySeekAnchorForSource(
 			return copySeekAnchor{}, err
 		}
 		copySeekAnchorProbeNeeds.record(sourceKey, time.Since(probeStarted))
+		// A probe that ran is not automatically evidence: an upstream that
+		// ignores the byte seek answers with the file's first keyframe, and
+		// publishing that as the timeline origin turns every seek into a reset
+		// to the start. Reject it here, before it is cached, so neither this
+		// call nor any later one can be served it.
+		if unusable := CopySeekAnchorUnusableError(requestedSeekSeconds, seconds); unusable != nil {
+			slog.WarnContext(ctx, "copy seek anchor cannot describe the requested position; rejecting it",
+				"component", "playback",
+				"requested_seek_seconds", requestedSeekSeconds,
+				"anchor_seconds", seconds,
+				"pre_roll_limit_seconds", MaxCopySeekPreRollSeconds,
+				"probe_ms", time.Since(probeStarted).Milliseconds(),
+				"error", unusable,
+			)
+			return copySeekAnchor{}, unusable
+		}
 		anchor := copySeekAnchor{seconds: seconds, segment: segment}
 		copySeekAnchors.store(sourceKey, requestedSeekSeconds, anchor)
 		// A resolved anchor is the one line that makes a slow link's progress

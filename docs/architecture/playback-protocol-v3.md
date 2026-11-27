@@ -1268,6 +1268,33 @@ seconds. A long-GOP source (a 10 s HEVC interval, for example) legitimately
 anchors more than five seconds back; a check against a fixed 5 s bar would flag
 it as an overshoot.
 
+A resolved anchor still has to be plausibly the requested position's own GOP.
+The resolver accepts a pre-roll of at most 30 s and rejects anything larger as
+`unusable`, without retrying and without caching it. Thirty seconds is the
+sanity ceiling, not the expected pre-roll: it is five times the 6 s packaging
+guidance ceiling for keyframe intervals and three times the longest interval
+the resolver is tested against, so every legitimate GOP passes while a source
+that ignored the byte seek and answered with the file's first keyframe does
+not. An anchor more than 0.25 s after the request is rejected the same way, as
+is an anchor whose clock does not match the requested timeline (a source PTS
+rebased onto the file start). The bound is a rejection threshold, so err toward
+rejecting: publishing a far-before anchor is worse than taking the seekable
+route below.
+
+A seek whose copy anchor is rejected is not served by the forward-only copy
+transport. The same request plans the decoded `server_transcode_hls` delivery
+at the requested target instead: a start re-plans before committing, and a
+seek reanchor of a running copy session probes the live pinned input before it
+replays the frozen recipe, so both answer a plan whose segment layer restarts
+FFmpeg at the target segment and the seek lands. A reanchor that could not run
+that early probe keeps the existing retryable verdict; the refusal is recorded
+against the requested file and target, and the viewer's retry start plans the
+decoded route at that target instead of repeating the copy probe. A rejected
+anchor is never written to the anchor cache, so a later seek into the interval
+it would have claimed re-probes rather than reusing it. The normal case is
+untouched: an anchor inside the accepted pre-roll still plans the copy route
+and keeps its player-start offset.
+
 A progressive remux seek that cannot resolve its anchor inside the first-output
 window is refused with the retryable `transcode_start_failed` seek verdict. The
 viewer's next start at that refused target gets one extended probe window, still
