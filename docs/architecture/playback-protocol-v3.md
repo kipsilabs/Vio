@@ -1270,13 +1270,18 @@ it as an overshoot.
 
 A progressive remux seek that cannot resolve its anchor inside the first-output
 window is refused with the retryable `transcode_start_failed` seek verdict. The
-viewer's next start at that refused target (`force_relink`) gets one extended
-probe window, still bounded by the probe's own timeout and the start deadline. If
-that retry still cannot anchor, the start answers the non-retryable
-`seek_anchor_unavailable` terminal instead of showing the same retry card again.
-The extension is keyed to the requested file and target and is consumed by that
-retry, so a later track change, a different position, or a second retry keeps the
-first-attempt budget.
+viewer's next start at that refused target gets one extended probe window, still
+bounded by the probe's own timeout and the start deadline. The retry is
+recognized from the recorded refusal (profile, requested file, target), not from
+`force_relink`: that flag asks the provider for a fresh pin, which a seek retry
+does not need, and a forced re-query can fail in resolve before the anchor probe
+the grant exists to extend. If that retry still cannot anchor, the start answers
+the non-retryable `seek_anchor_unavailable` terminal instead of showing the same
+retry card again. The retry attempt is sized from that extended window directly;
+the first attempt's retry-reservation margin, which keeps room for a second try
+inside a short first-output window, does not shrink it. The extension is keyed to
+the requested file and target and is consumed by that retry, so a later track
+change, a different position, or a second retry keeps the first-attempt budget.
 
 Segmented HLS does not carry the same offset. Its player starts at the target
 segment rather than at the transport's first frame, because the segment layer

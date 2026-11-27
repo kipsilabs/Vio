@@ -103,27 +103,34 @@ func TestCopySeekAnchorRefusalRetryEscalatesExactlyOnce(t *testing.T) {
 		seekFailure: true,
 	})
 
-	ctx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target, true)
+	ctx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target)
 	if !ok {
 		t.Fatal("retry of the recorded target did not get an escalation grant")
 	}
 	if seekAnchorRetryGrantFromContextV3(ctx) == nil {
 		t.Fatal("escalation grant missing from the retry context")
 	}
-	if _, again := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target, true); again {
+	if _, again := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target); again {
 		t.Fatal("the same refusal escalated twice")
 	}
 
+	// The client's real retry does not send force_relink: the recorded refusal
+	// identifies it by profile, requested file and target. Requiring a forced
+	// provider re-link would make the retry pay a resolve that can fail before
+	// the probe.
 	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, &transportErrorV3{
 		reason: transcodeStartFailedReasonV3, retryable: true, seekFailure: true,
 	})
-	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target, false); ok {
-		t.Fatal("a start without force_relink consumed the retry grant")
+	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target); !ok {
+		t.Fatal("a plain start at the refused target did not consume the retry grant")
 	}
-	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target+5, true); ok {
+	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, &transportErrorV3{
+		reason: transcodeStartFailedReasonV3, retryable: true, seekFailure: true,
+	})
+	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target+5); ok {
 		t.Fatal("a different seek target consumed the retry grant")
 	}
-	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target+0.4, true); !ok {
+	if _, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target+0.4); !ok {
 		t.Fatal("a retry within the target tolerance did not escalate")
 	}
 }
@@ -157,7 +164,7 @@ func TestPrepareTransportTimelineSeekAnchorRetryPlays(t *testing.T) {
 	}
 	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, transportErr)
 
-	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target, true)
+	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target)
 	if !ok {
 		t.Fatal("retry of the recorded target did not get an escalation grant")
 	}
@@ -201,7 +208,7 @@ func TestPrepareTransportTimelineSeekAnchorRetryFailureIsExplicit(t *testing.T) 
 	}
 	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, transportErr)
 
-	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target, true)
+	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target)
 	if !ok {
 		t.Fatal("retry of the recorded target did not get an escalation grant")
 	}
@@ -230,9 +237,9 @@ func TestPrepareTransportTimelineSeekAnchorRetryFailureIsExplicit(t *testing.T) 
 
 // TestHandleStartPlaybackSeekAnchorRetryEscalatesOnce maps the whole retry
 // path: a progressive remux start refuses the seek anchor and records the
-// refusal; the viewer's Try again is a fresh start with force_relink at the
-// same target. That start must get one extended probe window, not the first
-// attempt's short window, and it must play when the probe then answers.
+// refusal; the viewer's Try again is a fresh start at the same target. That
+// start must get one extended probe window, not the first attempt's short
+// window, and it must play when the probe then answers.
 func TestHandleStartPlaybackSeekAnchorRetryEscalatesOnce(t *testing.T) {
 	firstWindow, reserve, retryWindow := 300*time.Millisecond, 100*time.Millisecond, 900*time.Millisecond
 	shortenSeekAnchorRetryWindows(t, firstWindow, reserve, retryWindow)
@@ -305,7 +312,6 @@ func TestHandleStartPlaybackSeekAnchorRetryEscalatesOnce(t *testing.T) {
 	}
 
 	start.PlaybackAttemptID = "attempt-handler-seek-retry-0002"
-	start.ForceRelink = true
 	second := httptest.NewRecorder()
 	handler.HandleStartPlayback(second, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
 	if second.Code != http.StatusCreated {
@@ -331,5 +337,173 @@ func TestHandleStartPlaybackSeekAnchorRetryEscalatesOnce(t *testing.T) {
 	}
 	if budgets[1] < retryWindow-100*time.Millisecond {
 		t.Fatalf("retry probe budget = %v, want about the %v retry window", budgets[1], retryWindow)
+	}
+}
+
+// TestHandleReplanPlaybackSeekAnchorRefusalThenStartRetryEscalates maps the
+// measured production path rather than the start-refusal path above: a live
+// progressive-remux session refuses a seek reanchor at the anchor, the refusal
+// is recorded against the session's requested row, and the viewer's Try again
+// is a fresh start at the same target. That start must be recognized as the
+// retry even though the refused replan returned no session.
+func TestHandleReplanPlaybackSeekAnchorRefusalThenStartRetryEscalates(t *testing.T) {
+	firstWindow, reserve, retryWindow := 300*time.Millisecond, 100*time.Millisecond, 900*time.Millisecond
+	shortenSeekAnchorRetryWindows(t, firstWindow, reserve, retryWindow)
+
+	file := v3HandlerFixtureFile(t)
+	file.Container = "mkv"
+	file.FilePath = writePlaybackTestMediaFile(t, "movie.mkv")
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3(nil))
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool { return false }
+
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var budgets []time.Duration
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		call := calls.Add(1)
+		if deadline, ok := ctx.Deadline(); ok {
+			mu.Lock()
+			budgets = append(budgets, time.Until(deadline))
+			mu.Unlock()
+		}
+		if call == 1 {
+			<-ctx.Done()
+			return 0, 0, ctx.Err()
+		}
+		return requested, computeStartSegment(requested, segmentDuration), nil
+	}
+
+	start := v3HandlerStartRequest()
+	start.ClientPlaybackContext.Deliveries = map[string]playback.DeliveryCapabilityV3{
+		playback.DeliveryClassProgressiveV3: {Enabled: true, SupportedOnDevice: true},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, start)
+	if started.PlaybackPlan == nil || started.PlaybackPlan.Delivery != playback.DeliveryRemuxProgressiveV3 {
+		t.Fatalf("start plan = %#v, want progressive remux", started.PlaybackPlan)
+	}
+	applyReplanProgressV3(t, handler, started.SessionID)
+
+	const target = 918.161
+	seekReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationSeekReanchorV3,
+		PlaybackAttemptID:     start.PlaybackAttemptID,
+		ReplanRequestID:       "replan-seek-retry-refusal-001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-seek-retry-refusal-001",
+		PlanAttemptKey:        started.PlaybackPlan.PlanAttemptKey,
+		AttemptCount:          1,
+		PositionSeconds:       target,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	seekResp := postPlaybackReplanV3(t, handler, started.SessionID, seekReq)
+	if seekResp.Terminal == nil || seekResp.Terminal.Reason != transcodeStartFailedReasonV3 || !seekResp.Terminal.Retryable {
+		t.Fatalf("seek replan terminal = %#v, want the retryable seek refusal", seekResp.Terminal)
+	}
+
+	// The visible Try again: a fresh attempt at the refused target. The client
+	// does not send force_relink; the recorded refusal identifies the retry.
+	retry := start
+	retry.PlaybackAttemptID = "attempt-handler-replan-seek-retry-0002"
+	retry.StartPosition = new(float64)
+	*retry.StartPosition = target
+	retried := startV3PlaybackForHandlerTest(t, handler, retry)
+	if retried.Terminal != nil || retried.PlaybackPlan == nil {
+		t.Fatalf("retry terminal = %#v, plan = %#v, want a played retry", retried.Terminal, retried.PlaybackPlan)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("anchor probes = %d, want the refused replan plus one escalated retry", calls.Load())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(budgets) != 2 {
+		t.Fatalf("probe budgets = %v, want two observations", budgets)
+	}
+	if budgets[0] > firstWindow-reserve+75*time.Millisecond {
+		t.Fatalf("refused replan probe budget = %v, want the %v first-output window", budgets[0], firstWindow-reserve)
+	}
+	if budgets[1] < retryWindow-100*time.Millisecond {
+		t.Fatalf("retry probe budget = %v, want about the %v retry window", budgets[1], retryWindow)
+	}
+}
+
+// TestPrepareTransportTimelineSeekAnchorRetryWindowIgnoresCallerRetryMargin
+// pins the granted retry against the first attempt's retry-reservation margin.
+// With the caller's deadline between the margin and the extended window, a
+// budget sized as "remaining minus the margin" would be shorter than the
+// window the viewer was granted and would re-answer the first attempt's
+// refusal. The retry is sized from the window; the caller's actual deadline
+// still bounds it.
+func TestPrepareTransportTimelineSeekAnchorRetryWindowIgnoresCallerRetryMargin(t *testing.T) {
+	const target = 918.161
+	retryWindow := 2 * time.Second
+	shortenSeekAnchorRetryWindows(t, 200*time.Millisecond, 50*time.Millisecond, retryWindow)
+	handler, session, file, _ := seekAnchorRetryFixture(t, "retry-caller-margin", target)
+
+	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, &transportErrorV3{
+		reason: transcodeStartFailedReasonV3, retryable: true, seekFailure: true,
+	})
+	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target)
+	if !ok {
+		t.Fatal("retry of the recorded target did not get an escalation grant")
+	}
+	// The caller has more time than the window but less than the window plus
+	// the 5 s retry margin. The extended window must survive.
+	callerCtx, cancel := context.WithTimeout(retryCtx, retryWindow+4*time.Second)
+	defer cancel()
+
+	var budget time.Duration
+	handler.copySeekAnchor = func(ctx context.Context, _ string, _ string, requested float64, segmentDuration int) (float64, int, error) {
+		if deadline, ok := ctx.Deadline(); ok {
+			budget = time.Until(deadline)
+		}
+		return requested, computeStartSegment(requested, segmentDuration), nil
+	}
+	plan := &playback.PlanV3{
+		PlanID:   "plan:retry-caller-margin",
+		Delivery: playback.DeliveryRemuxProgressiveV3,
+		Timeline: playback.TimelineV3{SourceStartSeconds: target, PlayerStartSeconds: target},
+	}
+	if _, transportErr := handler.prepareTransportTimelineV3(callerCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux}); transportErr != nil {
+		t.Fatalf("retry = %#v, want a playable anchor", transportErr)
+	}
+	if budget < retryWindow-100*time.Millisecond {
+		t.Fatalf("retry probe budget = %v, want the %v extended window, not the caller's margin-clamped budget", budget, retryWindow)
+	}
+}
+
+// TestPrepareTransportTimelineSeekAnchorRetryTransientFailureIsExplicit pins
+// that the granted retry terminates rather than handing back the same retry
+// card when the anchor fails for a reason other than its own window expiring.
+func TestPrepareTransportTimelineSeekAnchorRetryTransientFailureIsExplicit(t *testing.T) {
+	const target = 918.161
+	shortenSeekAnchorRetryWindows(t, 200*time.Millisecond, 50*time.Millisecond, 500*time.Millisecond)
+	handler, session, file, _ := seekAnchorRetryFixture(t, "retry-transient", target)
+	handler.copySeekAnchorBackoff = func(context.Context, time.Duration) bool { return false }
+	handler.copySeekAnchor = func(context.Context, string, string, float64, int) (float64, int, error) {
+		return 0, 0, fmt.Errorf("%w: upstream 503", playback.ErrTransientProvider)
+	}
+
+	handler.recordCopySeekAnchorRefusalV3(seekAnchorRetryTestProfile, file.ID, target, &transportErrorV3{
+		reason: transcodeStartFailedReasonV3, retryable: true, seekFailure: true,
+	})
+	retryCtx, ok := handler.copySeekAnchorRetryContextV3(context.Background(), seekAnchorRetryTestProfile, file.ID, target)
+	if !ok {
+		t.Fatal("retry of the recorded target did not get an escalation grant")
+	}
+	plan := &playback.PlanV3{
+		PlanID:   "plan:retry-transient",
+		Delivery: playback.DeliveryRemuxProgressiveV3,
+		Timeline: playback.TimelineV3{SourceStartSeconds: target, PlayerStartSeconds: target},
+	}
+	_, retryErr := handler.prepareTransportTimelineV3(retryCtx, session, file, playback.PlannerResultV3{Plan: plan, PlayMethod: playback.PlayRemux})
+	if retryErr == nil || retryErr.reason != seekAnchorUnavailableReasonV3 || retryErr.retryable {
+		t.Fatalf("retry error = %#v, want the non-retryable %q terminal", retryErr, seekAnchorUnavailableReasonV3)
 	}
 }

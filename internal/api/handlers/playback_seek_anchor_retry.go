@@ -160,12 +160,17 @@ func (h *PlaybackHandler) recordCopySeekAnchorRefusalV3(profileID string, reques
 }
 
 // copySeekAnchorRetryContextV3 turns a viewer's retry into a context grant for
-// prepareTransportTimelineV3. It requires force_relink (the client's retry
-// Start uses it) and a target that matches the recorded refusal. The refusal
-// is consumed here, so the extension cannot leak into a later unrelated start
-// and a second retry of the same target is an ordinary first attempt.
-func (h *PlaybackHandler) copySeekAnchorRetryContextV3(ctx context.Context, profileID string, requestedFileID int, target float64, forceRelink bool) (context.Context, bool) {
-	if h == nil || h.copySeekAnchorRefusals == nil || !forceRelink || target <= 0 {
+// prepareTransportTimelineV3. The retry is identified by the refusal this
+// handler just recorded: the same profile, requested file and target, matched
+// within the tolerance and consumed once. It deliberately does not require
+// force_relink. That flag asks the provider for a fresh pin, which is the last
+// thing a seek retry needs: the refused seek is on the source already playing,
+// and a forced provider re-query can fail in resolve before the anchor probe
+// this grant exists to extend. A fresh start at the refused target is the
+// retry, and the consumed mark keeps an unrelated later start from inheriting
+// it.
+func (h *PlaybackHandler) copySeekAnchorRetryContextV3(ctx context.Context, profileID string, requestedFileID int, target float64) (context.Context, bool) {
+	if h == nil || h.copySeekAnchorRefusals == nil || target <= 0 {
 		return ctx, false
 	}
 	if !h.copySeekAnchorRefusals.take(seekAnchorRefusalKey(profileID, requestedFileID), target) {

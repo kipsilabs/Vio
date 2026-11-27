@@ -4189,6 +4189,10 @@ export function usePlaybackSession(
           ? "auto"
           : (retryTargetRef.current?.fileSelection ??
             (explicitFileSelection ? "explicit" : "auto")),
+        // No force_relink for a refused-seek retry. The server recognizes the
+        // retry from the refusal it recorded at this file and target; forcing
+        // a provider re-link here would make the retry re-resolve the source
+        // and can fail before the extended anchor probe it exists to reach.
         intentAt: null,
         // A caller that names the intent owns it; otherwise the last reported
         // state stands, as it did before the retry card.
