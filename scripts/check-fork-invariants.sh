@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015 # "cmd && ok || fail" is the intended one-shot check here
 # Fork invariants: fail loudly when an upstream merge (or local edit) breaks a
 # deliberate Vio divergence. See docs/architecture/fork-divergence.md.
 # Commands assume the repository root is the cwd.

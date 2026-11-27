@@ -110,7 +110,10 @@ export function scanStatusClass(
     case "accepted":
       return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
     case "cancelled":
+    case "canceled":
       return "border-amber-500/30 bg-amber-500/10 text-amber-500";
+    default:
+      return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
   }
 }
 
