@@ -149,6 +149,24 @@ Deferred upstream projects:
 - Admin Insights and the Playback History rework: #5279, #5321, #5301, which
   are built on the #5269 session/history schema.
 
+The sync also keeps the fork's API/UI layer at this base, because upstream
+rewrote the handler and catalog files those divergences sit on:
+
+- `internal/api/handlers` and `internal/catalog`: virtual-library reads,
+  collections and poster handling, version liveness, and the handler views the
+  fork's v2 layer serves.
+- `internal/apiv2`: upstream's v2 files call handler and catalog APIs that only
+  exist in upstream's rewritten handler layer.
+- `web/`: the app consumes the pinned v2 contract; upstream's web changes ride
+  with the deferred v2 surface.
+
+A future adoption therefore starts by porting the fork handler layer onto
+upstream's `items.go`, `collections.go`, collection repository and detail
+reads, then moves `internal/apiv2` and `web/` with it. The deferred upstream
+handler and catalog fixes from this window (item collections, card
+availability, profile request blocking, version-liveness reads, poster
+handling) come with that work.
+
 Reason: the fork's playback engine is a deliberate divergence
 (`internal/playback`, the virtual-library playback paths, the compat wiring,
 and #482–#495). The upstream projects above rewrite the same session, copy,
