@@ -728,10 +728,13 @@ func uninstallNode(out io.Writer) error {
 	return err
 }
 
-// waitNodeReady polls the new node's health until it answers 200 as a
-// transcode node (node_control_version set) whose key the server took.
-// drained reports a node an administrator drained, which stays drained
-// across restarts and is ready all the same.
+// waitNodeReady polls the new node's health until it answers 200 with one of
+// the transcode node's health statuses. The fork's node shares the server's
+// worker signing secret and its health answer has no per-node key handshake
+// fields (node_control_version, key_rejected), so the status value is the
+// discriminator that something other than a Silo transcode node did not
+// answer. drained reports a node an administrator drained, which stays
+// drained across restarts and is ready all the same.
 func waitNodeReady(ctx context.Context, settings nodeInstallSettings) (drained bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, nodeReadyTimeout)
 	defer cancel()
@@ -745,11 +748,10 @@ func waitNodeReady(ctx context.Context, settings nodeInstallSettings) (drained b
 		switch {
 		case err != nil:
 			last = err.Error()
-		case health.NodeControlVersion < 1:
+		case health.Status != transcodenode.HealthStatusOK &&
+			health.Status != transcodenode.HealthStatusDraining &&
+			health.Status != transcodenode.HealthStatusDrained:
 			last = "something other than a Silo transcode node answers on the port"
-		case health.KeyRejected:
-			return false, fmt.Errorf("the server at %s refused this node's key. Check that it is the key Admin > Nodes on that server last issued "+
-				"for this node, and that this Mac's clock is within 30 seconds of the server's", settings.server)
 		default:
 			return health.Status == transcodenode.HealthStatusDraining || health.Status == transcodenode.HealthStatusDrained, nil
 		}
