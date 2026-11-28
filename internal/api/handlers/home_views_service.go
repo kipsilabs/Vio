@@ -50,6 +50,7 @@ func (h *SectionHandler) HomeSections(ctx context.Context, viewer SectionViewer)
 	withItems = cutCappedSectionItems(withItems, viewer.ItemLimitCap)
 	withItems = applyDiversityFilter(withItems)
 	withItems = dropEmptySeasonalSections(withItems)
+	withItems = dropEmptySections(withItems)
 	response := h.buildSectionsWithUserStates(ctx, withItems, nil, viewer.Access, viewer.Artwork(), userStates)
 	itemCount := 0
 	for _, section := range withItems {

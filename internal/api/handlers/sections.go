@@ -1368,6 +1368,22 @@ func applyDiversityFilter(withItems []sections.SectionWithItems) []sections.Sect
 // no items so the home page doesn't render an empty row off-season. Called
 // from the aggregate handlers; per-section endpoints still return empty
 // seasonal sections when explicitly requested by ID.
+// dropEmptySections leaves out aggregate rows with nothing to show: an
+// admin-curated or collection row whose titles all sit outside the viewer's
+// access has no cards, and a section of collection posters has cards in
+// Collections rather than Items. A single-section read still answers its row
+// empty; only the aggregate page omits it.
+func dropEmptySections(withItems []sections.SectionWithItems) []sections.SectionWithItems {
+	out := withItems[:0]
+	for _, w := range withItems {
+		if len(w.Items) == 0 && len(w.Collections) == 0 {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
 func dropEmptySeasonalSections(withItems []sections.SectionWithItems) []sections.SectionWithItems {
 	out := withItems[:0]
 	for _, w := range withItems {
