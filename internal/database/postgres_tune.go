@@ -432,7 +432,7 @@ func parsePostgresTuneMode(raw string) (bool, string, error) {
 		return true, postgresTuneProfileOLTP, nil
 	case postgresTuneProfileOLTP:
 		return true, postgresTuneProfileOLTP, nil
-	case "0", "false", "no", "off", "none", "disabled":
+	case "0", "false", "no", jitOff, "none", "disabled":
 		return false, "", nil
 	default:
 		return false, "", fmt.Errorf("invalid POSTGRES_TUNE value %q", raw)

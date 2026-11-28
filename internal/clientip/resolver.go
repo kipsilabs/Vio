@@ -235,7 +235,7 @@ func (r *Resolver) requestScheme(req *http.Request) string {
 		}
 	case forwardedProtoWSS:
 		if isWebSocketUpgrade(req) {
-			return "https"
+			return schemeHTTPS
 		}
 	}
 	return ""
