@@ -152,7 +152,7 @@ func TestLoginAccountNameWithHashDB(t *testing.T) {
 		}
 	}
 
-	svc.SetSignInAttempts(ratelimit.NewMemorySignInLimiter(ratelimit.SignInNamePolicy, ratelimit.SignInSourcePolicy))
+	svc.SetSignInAttempts(ratelimit.NewMemorySignInLimiter(ratelimit.AttemptPolicy{MaxAttempts: 2, Window: time.Minute}, ratelimit.SignInSourcePolicy))
 	// Successful profile sign-ins clear what they spend, so they never lock.
 	for range 3 {
 		signIn(plain.Username+"#Kid", plain, "Kid")

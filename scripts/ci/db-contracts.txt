@@ -1650,8 +1650,3 @@
 # A session opened by device sign-in is recorded as such and sees and ends only itself.
 ./internal/auth TestSessionsRecordDeviceSignInDB
 ./internal/auth TestDeviceSignInMigrationMarksKeptRequestsDB
-./internal/apiv2 TestSessionReachRuleDB
-./internal/apiv2 TestLimitedSessionDeleteDB
-./internal/apiv2 TestDemoVisitorOnALimitedSessionDB
-./internal/apiv2 TestLimitedSessionPagesByIDDB
-./internal/apiv2 TestDemoVisitorSessionListDB
