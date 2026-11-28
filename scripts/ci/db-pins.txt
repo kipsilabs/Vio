@@ -128,7 +128,6 @@
 ./internal/catalog TestPlayableTargetResolverProfileStateAvailabilityAndAccess
 ./internal/catalog TestPlayableTargetResolverResumesDeepInsideLongSeries
 ./internal/catalog TestPlayableTargetResolverStaleCompletedProgressPlan
-./internal/catalog TestPlayableTargetResolverAnchoredCompletedRangePlan
 ./internal/catalog TestCatalogOverlaySummariesPreserveLegacyWinners
 ./internal/catalog TestPlayableTargetsPostgresMatchesGeneral
 

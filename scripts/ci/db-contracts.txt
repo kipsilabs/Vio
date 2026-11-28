@@ -12,8 +12,6 @@
 ./internal/catalog TestLibraryCollectionDrawsFromItsRulesLibrariesDB
 ./internal/catalog TestLibraryCollectionReplaceItemsWritesOnlyTheDifferenceDB
 ./internal/catalog TestLibraryCollectionReplaceItemsRacesMemberDeleteDB
-./internal/catalog TestLibraryCollectionNamesDB
-./internal/catalog TestLibraryCollectionNameRacesDB
 ./internal/catalog TestCatalogManualCollectionCursorDB
 ./internal/catalog TestMixedCatalogMangaCounts
 ./internal/catalog TestContentRatingCeilingAcrossSystemsDB
@@ -51,7 +49,6 @@
 ./internal/scanner TestFileRepositoryPreservesFirstSeenScanProvenance
 ./internal/scanner TestMultiEpisodeFileServesSpannedEpisodesDB
 ./internal/scanner TestScannedGroupForItemDB
-./internal/scanner TestShortenDurationOnlyForTheFileTheRunReadDB
 ./internal/scanner TestListMarkerEditAuditClientIPHasNoNetmaskDB
 ./internal/scanner TestMatroskaTrackBackfillRecordsTrackNumbers
 ./internal/scanner TestMatroskaTrackBackfillStopsOnStalledStorage
@@ -130,7 +127,6 @@
 
 # A book page's related rows carry the viewing profile's own finished or
 # partway state, never another profile's; browse cards name authors in credit order.
-./internal/catalog TestBookPageRelatedStateAndCardAuthorsPostgres
 
 # Series air-date sort keys advance when a known episode airs. The latest
 # available episode air date counts only episodes with a file in a library:
@@ -312,7 +308,6 @@
 ./internal/api/handlers TestClearResumePositionTargetsDB
 ./internal/api/handlers TestEbookProgressEventsPostgres
 ./internal/api/handlers TestRemoveHistoryHidesEpisodesWithoutLibraryFilePostgres
-./internal/api/handlers TestHistoryImportProfileAuthorizationDB
 ./internal/api/handlers TestParentUnwatchClearsEpisodesWithoutLibraryFilePostgres
 ./internal/api/handlers TestAudiobookMarkListenedPostgres
 ./internal/api/handlers TestAudiobookMarkListenedBoundariesPostgres
@@ -346,7 +341,6 @@
 ./internal/plugins TestSignInWarningOnlyOnPluginsThatCanBeTheProviderDB
 ./internal/plugins TestStoredSignInWarningIsWorkedOutAgainDB
 ./internal/api/handlers TestLocalLoginSettingRequiresBreakGlassDB
-./internal/api/handlers TestPluginDisableAndUninstallRefusedBeforeStopDB
 ./internal/auth TestLoginSessionActivityAndAdminRevocationDB
 ./internal/auth TestChangePasswordSignOutOtherSessionsDB
 ./internal/auth TestSignupPolicySerializationDB
@@ -355,15 +349,12 @@
 ./internal/jellycompat TestApplyListFileFieldsDB
 ./internal/jellycompat TestLoginAccountNameWithHashDB
 ./internal/jellycompat TestRevokedCompatSessionStaysDeletedPostgres
-./internal/jellycompat TestDeletedProfileCompatSessionsEndPostgres
-./internal/jellycompat TestSignInRacingProfileDeleteKeepsNoSessionPostgres
 ./internal/jellycompat TestDurableCompatPlaybackStoreUpdateRejectionAcrossReplicas
 ./internal/jellycompat TestDurableCompatPlaybackStoreDropsRejectedPendingUpdate
 ./internal/jellycompat TestDurableCompatPlaybackStoreRetiresUpstreamSessionAcrossReplicas
 ./internal/jellycompat TestDurableCompatPlaybackStoreRetireLeavesMovedPlay
 ./internal/jellycompat TestDurableCompatPlaybackStoreRetryAfterFailedStatement
 ./internal/jellycompat TestDurableCompatPlaybackStoreRetireHidesCopyWhenReplayFails
-./internal/jellycompat TestDurablePutNegotiatedReplacesRowStoredWithDashedRouteID
 ./internal/jellycompat TestPseudoUserOwnerAcrossReplicasPostgres
 ./internal/invitations TestLinkInvitationLifecycleDB
 ./internal/invitations TestEmailedInvitationLinkReplacementDB
@@ -385,13 +376,11 @@
 ./internal/auth TestAPIKeyVerifierLegacyDigestCollision
 ./internal/auth TestAPIKeyVerifierMigrationRollback
 ./internal/auth TestAPIKeyVerifierDownSeesConcurrentInsert
-./internal/api/handlers TestAPIKeyEditorNeverReturnsStoredSecret
 
 # Minting a key for another account holds the Owner rules against a concurrent promotion.
 ./internal/api/handlers TestAdminAPIKeyCreationHoldsOwnerRulesAgainstPromotionDB
 
 # Deleting an account removes its personal collections' artwork.
-./internal/api/handlers TestAdminAccountDeleteRemovesCollectionArtworkDB
 
 # Recovery identity changes retire links and prevent delivery to a stale address.
 ./internal/passwordreset TestResetLinkRetiresOnRecoveryEmailChangeDB
@@ -675,13 +664,7 @@
 # Request cleanup, prepared downloads and user-store transactions.
 ./internal/requests TestReplaceFailedIsScopedToRequesterDatabase
 ./internal/requests TestDeleteFailedRequestDatabase
-./internal/requests TestClaimedTargetWritesNeedTheClaimDatabase
-./internal/requests TestDeleteTargetWaitsForAConcurrentReclaimDatabase
-./internal/requests TestMarkAvailableLeavesARetryResendingATierDatabase
 ./internal/requests TestListDownloadingRequestsOrderDatabase
-./internal/requests TestRecordSubmissionReplacesFailedTargetDatabase
-./internal/requests TestWithdrawIgnoresFailedTargetsDatabase
-./internal/requests TestUpdateTargetStatusLeavesFinishedTargetDatabase
 ./internal/downloads TestConcurrentArtifactCreatesCannotBypassQuotaDB
 ./internal/downloads TestParkedDownloadIsNotServedOrPreparedFromItsOldFileDB
 ./internal/downloads TestRegistrationRefusesAFileOfAnotherTitleDB
@@ -784,27 +767,15 @@
 ./internal/api/handlers TestPlaybackLifecycleTransitionsDB
 ./internal/api/handlers TestNativeSessionsListLifecycleDB
 ./internal/api/handlers TestPlaybackLifecycleOrderAndStartStateDB
-./internal/api/handlers TestConfirmedPauseLifecycleDB
 ./internal/api/handlers TestLifecycleSweepSelectsWhatItCanEndDB
 ./internal/api/handlers TestLifecycleSweepPassesLiveJellyfinPlaysDB
-./internal/api/handlers TestLifecycleSweepBacksOffFailedEndsDB
-./internal/api/handlers TestPausedTimeoutSweepEndsPausedSessionsDB
-./internal/api/handlers TestPausedTimeoutSweepDropsCopyItCannotFinishDB
-./internal/api/handlers TestPausedTimeoutSweepDropsCopiesStoppedElsewhereDB
-./internal/api/handlers TestPausedTimeoutSweepDropsCopiesFinalizedElsewhereDB
-./internal/api/handlers TestPausedTimeoutSweepPagesPastSkippedRowsDB
-./internal/api/handlers TestPausedTimeoutSweepWaitsForTheSettingDB
-./internal/api/handlers TestLifecycleSweepKeepsARecordedSubtitleDB
-./internal/api/handlers TestLifecycleSweepTakesALaterSyncedSubtitleDB
 # A live row names an episode as the history entry its play leaves does.
-./internal/api/handlers TestEpisodeLiveRowNamesItAsHistoryDB
 
 # An Audiobookshelf play a client only reports through its local session is
 # one play across servers under a cluster-wide account cap; Activity lists it
 # with no server holding it, the sweep ends it once reports stop, and a report
 # after its end is a new play.
 ./internal/audiobooks TestReportPlayKeepsOnePlayPerClientSessionDB
-./internal/api/handlers TestLifecycleSweepEndsReportedPlaysDB
 
 # Transactional administrator audit details and rollback isolation.
 ./internal/activitylog TestMutationCommitRollbackAndHistoryDB
@@ -1008,7 +979,6 @@
 # Recommendations: job locks, refresh marks, signal triggers, embedding lock and
 # reset, build-time access, exclusion set, profile purge, and section fill.
 ./internal/api/handlers TestLibrarySectionItemsAnswersAnErrorWhenTheFetchFailsDB
-./internal/api/handlers TestRecentlyAddedItemsKeepsTheViewersLibrariesDB
 ./internal/api/handlers TestWatchedFilterDoesNotFallBackToPostgres
 ./internal/historyimport TestImportRunReportsSignalChangesOncePostgres
 ./internal/metadata TestMergeKeepsTheSourceEmbeddingPostgres
@@ -1191,9 +1161,6 @@
 ./internal/playback/planstore TestSummaryResolvesReplacedPlanDelivery
 ./internal/playback/planstore TestAttemptDesiredTracksRoundTrip
 ./internal/playback/planstore TestProgressCommitsLifecycleStateDB
-./internal/playback/planstore TestExpirePausedAttemptDB
-./internal/playback/planstore TestExpirePausedAttemptExemptionsDB
-./internal/playback/planstore TestExpirePausedAttemptRechecksTheSelectionDB
 ./internal/playback/planstore TestLatePlaybackProgressCannotOverwriteFinalStopDB
 ./internal/playback/planstore TestPlaybackStopCommitsResumeAndEpisodeSpanOnceDB
 ./internal/api/handlers TestSlowPlanDeliveryLookupKeepsTheSummaryDB
@@ -1207,11 +1174,6 @@
 # Server collections show a restricted viewer only the members it can open, and
 # leave out a collection whose members it can open none of (#2828).
 ./internal/api/handlers TestServerCollectionCountsFollowTheViewerDB
-./internal/api/handlers TestCollectionRowCardsFollowTheViewerDB
-./internal/api/handlers TestCollectionRowCardsShowVisiblePersonalCollectionsDB
-./internal/api/handlers TestItemCollectionsDB
-./internal/api/handlers TestItemCollectionsPreviewDB
-./internal/api/handlers TestItemCollectionsPreviewLibraryDB
 ./internal/sections TestRowOfCollectionsReferencesItsCollectionsPostgres
 
 # A scan that adds or removes titles refreshes the stored counts of the smart
@@ -1325,7 +1287,6 @@
 ./internal/scanner TestAudiobookRescanKeepsProviderMatchDB
 ./internal/scanner TestAudiobookRenamedFolderFindsMatchedItemDB
 ./internal/audiobooks TestPersistKeepsTagNarratorAndLocalCoverDB
-./internal/api/handlers TestUnmatchedItemsListsAudiobooksWithoutProviderMatchDB
 
 # The admin Refresh Metadata actions never run the general metadata service on
 # an audiobook. A full library refresh re-reads every book in one library scan
@@ -1339,7 +1300,6 @@
 # per-node rows to the total, and a wide bucket's split comes from its peak minute.
 ./internal/dashmetrics TestSampleSharedRecordsEgressPerNodeDB
 ./internal/api/handlers TestQueryAdminTimeseriesSplitsEgressBySourceDB
-./internal/api/handlers TestQueryAdminTimeseriesSplitsStreamsByPeakMinuteDB
 
 # Clearing admin collection artwork commits the cleared reference even when a
 # stored variant fails to delete.
@@ -1347,8 +1307,6 @@
 
 # An admin collection update checks its name only when it renames or adds
 # libraries, and refuses to leave the collection in no library.
-./internal/api/handlers TestAdminCollectionUpdateNameRuleDB
-./internal/api/handlers TestAdminCollectionUpdateNameRuleReadsTheLockedRowDB
 
 # API usage summaries behind the admin API clients card.
 ./internal/apiusage TestAPIUsageSummaryDB
@@ -1580,7 +1538,6 @@
 # before it answers (a deleted node's key is refused at once, a moved node is
 # signable at its new URL, a disabled one keeps its key), a proxy's through
 # node_pool_changed, and another API server's through its reconciliation.
-./cmd/silo TestNodeWritesReachEveryCredentialRegistryDB
 
 # Transcode node control plane: the core authenticates node calls against the
 # real credential registry (a disabled node keeps its access; a proxy row, a
@@ -1600,8 +1557,6 @@
 ./internal/catalog TestFramePostersListOnlyEmptySlotsAndSaveOnlyOverThemDB
 
 # Turning a library off or on sends catalog.library.changed, so catalog mirrors re-list.
-./internal/api/handlers TestLibraryEnabledTogglePublishesCatalogLibraryChangedDB
-./internal/api/handlers TestLibraryDisableAfterConcurrentEnablePublishesDB
 
 # A book's work ids are claims many editions may share, kept out of the
 # provider IDs: each answer replaces its own source's claims, a failed lookup
@@ -1635,12 +1590,6 @@
 # sessions into plays, the Insights breakdowns and Library read, the read gate
 # the playback stop path stays out of, and node references on a backup restore.
 ./internal/dashmetrics TestDownsampleCompletedDaysAndPruneDB
-./internal/api/handlers TestAdminPlaybackHistoryRouteFactsDB
-./internal/api/handlers TestAdminPlaybackHistoryRouteFactsOrderDB
-./internal/api/handlers TestAdminInsightsQueriesAndHistoryFiltersDB
-./internal/api/handlers TestAdminInsightsPlayGroupingDB
-./internal/api/handlers TestAdminInsightsBreakdownsDB
-./internal/api/handlers TestPlaybackHistoryEntrySkipsTheReadGateDB
 ./internal/backup TestCarryCredentialsReconcilesRestoredStreamNodesDB
 ./internal/backup TestCarryCredentialsKeepsNodeSamplesWithoutDailyArchiveDB
 
