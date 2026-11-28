@@ -15,7 +15,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
-func TestEncryptedSettingsValueAtomicSerializesWithoutBlockingGeneralSettingsDB(t *testing.T) {
+func TestEncryptedSettingsValueAtomicSerializesWithoutBlockingGeneralSettingsDB(t *testing.T) { //nolint:funlen // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -132,7 +132,7 @@ func TestEncryptedSettingsValueAtomicSerializesWithoutBlockingGeneralSettingsDB(
 	}
 }
 
-func TestSettingsValueWaitersPreservePoolCapacityDB(t *testing.T) {
+func TestSettingsValueWaitersPreservePoolCapacityDB(t *testing.T) { //nolint:funlen // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")

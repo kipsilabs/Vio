@@ -141,7 +141,7 @@ func (w *MatchWorker) SetRealtimeHub(hub *notifications.Hub) {
 	w.realtimeHub = hub
 }
 
-// Run starts the match worker loop. It blocks until ctx is cancelled.
+// Run starts the match worker loop. It blocks until ctx is canceled.
 func (w *MatchWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()

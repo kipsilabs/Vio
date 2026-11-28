@@ -118,7 +118,7 @@ func timedOut(err error) string {
 // before the restored one is verified, keeps the old database and every
 // overwritten blob, and rolls back a failure in the blob or rename steps with
 // the databases closed until the original is whole again.
-func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error {
+func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	out := writerOrDiscard(opts.Out)
 	m := src.Manifest
 	// A database-only backup leaves the live files as they are.

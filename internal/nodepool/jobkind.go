@@ -1,7 +1,6 @@
 package nodepool
 
 import (
-	"encoding/json"
 	"strings"
 )
 
@@ -53,25 +52,4 @@ func CodecJobKind(targetVideoCodec, targetAudioCodec string) JobKind {
 
 func isCopyCodec(codec string) bool {
 	return strings.EqualFold(strings.TrimSpace(codec), "copy")
-}
-
-// jobsByKindStatsView is the part of a node's stored last_stats that carries
-// its active jobs by kind; see marshalLastStats.
-type jobsByKindStatsView struct {
-	ActiveJobsByKind map[JobKind]int `json:"active_jobs_by_kind"`
-}
-
-// reportedJobsByKind returns the active jobs by kind from the node's last
-// health report. ok is false when the node did not report a breakdown (a build
-// from before job kinds), which callers must treat as "cannot say", never as
-// zero: a node that reports nothing would otherwise always look idle.
-func reportedJobsByKind(n *Node) (jobs map[JobKind]int, ok bool) {
-	if n == nil || len(n.LastStats) == 0 {
-		return nil, false
-	}
-	var view jobsByKindStatsView
-	if err := json.Unmarshal(n.LastStats, &view); err != nil || view.ActiveJobsByKind == nil {
-		return nil, false
-	}
-	return view.ActiveJobsByKind, true
 }

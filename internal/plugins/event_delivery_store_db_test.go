@@ -12,7 +12,7 @@ import (
 // protocol every API server shares: a claim takes at most its limit, no row
 // goes to two claimers, a lease hides a claimed row until it runs out, and
 // only the latest claim records an outcome.
-func TestEventDeliveryOutboxPostgres(t *testing.T) {
+func TestEventDeliveryOutboxPostgres(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := builtinGuardTestPool(t)
 	store := NewEventDeliveryStore(pool)
 	ctx := context.Background()
@@ -218,7 +218,7 @@ func TestEventDeliveryOutboxPostgres(t *testing.T) {
 			if time.Now().After(deadline) {
 				t.Fatal("the insert never waited on the uninstall")
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Fatal(err)

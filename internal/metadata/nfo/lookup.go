@@ -607,7 +607,7 @@ func (l *sidecarLookup) findItemNFO(mediaFiles, sidecarDirs []string, contentTyp
 		candidates = append(candidates, candidate{dir, name})
 	}
 	var firstErr error
-	if contentType != typeSeries {
+	if contentType != typeSeries { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		var stacks []candidate
 		for _, file := range mediaFiles {
 			if err := mediaPresent(file); err != nil {

@@ -92,7 +92,7 @@ func (r *skippedRootMemoryRepo) has(folderID int, rootPath string) bool {
 
 // settleControlledMatcher simulates a TV match drainer whose provider lookup is
 // still in flight when the settle window expires. The batch only returns once
-// the test releases it, so the test can catch stopDrainers cancelling the active
+// the test releases it, so the test can catch stopDrainers canceling the active
 // batch context instead of only stopping the drainer loop.
 type settleControlledMatcher struct {
 	batchCalls            atomic.Int64
@@ -211,7 +211,7 @@ func (s *finalizeRecordingScanner) FinalizeVariantsByPathPrefix(context.Context,
 
 // TestIngestFolderLetsActiveDrainerBatchFinishAfterSettleWindow is a regression
 // test for the settle-window cancellation bug: a TV library full scan was
-// recorded as "cancelled" because stopDrainers cancelled a drainer batch that
+// recorded with the terminal status because stopDrainers canceled a drainer batch that
 // was already in flight. The active batch must be allowed to finish; otherwise
 // rows it already claimed can be excluded from the final scoped matcher by the
 // runStartedAt attempt window.
@@ -261,7 +261,7 @@ func TestIngestFolderLetsActiveDrainerBatchFinishAfterSettleWindow(t *testing.T)
 		t.Fatal("drainer never ran a batch; test did not exercise the settle-window shutdown path")
 	}
 	if matcher.batchCtxCanceled.Load() {
-		t.Fatal("settle-window shutdown cancelled the active drainer batch context")
+		t.Fatal("settle-window shutdown canceled the active drainer batch context")
 	}
 	if matcher.processAllBeforeBatch.Load() {
 		t.Fatal("final scoped matcher ran before the active drainer batch completed")

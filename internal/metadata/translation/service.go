@@ -383,7 +383,7 @@ func (s *Service) Cancel(ctx context.Context, id int64) error {
 		return nil
 	}
 	if !job.Status.Terminal() {
-		return s.repo.FailJob(ctx, id, jobrunner.StatusCancelled, "cancelled")
+		return s.repo.FailJob(ctx, id, jobrunner.StatusCancelled, "canceled")
 	}
 	return nil
 }
@@ -395,7 +395,7 @@ func (s *Service) dispatch(job Job, textConfig *llm.Config) {
 		}
 		s.run(ctx, &job)
 	}, func(ctx context.Context) {
-		_ = s.repo.FailJob(ctx, job.ID, jobrunner.StatusCancelled, "cancelled before start")
+		_ = s.repo.FailJob(ctx, job.ID, jobrunner.StatusCancelled, "canceled before start")
 	})
 }
 
@@ -925,7 +925,7 @@ func (s *Service) finishWithError(ctx context.Context, job *Job, err error) {
 	msg := llm.Truncate(err.Error(), 500)
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		status = jobrunner.StatusCancelled
-		msg = "cancelled"
+		msg = "canceled"
 	}
 	if dbErr := s.repo.FailJob(context.WithoutCancel(ctx), job.ID, status, msg); dbErr != nil {
 		s.logger.WarnContext(ctx, "failed to record metadata translation job failure", "job", job.ID, "error", dbErr)

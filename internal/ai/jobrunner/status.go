@@ -8,7 +8,7 @@ const (
 	StatusRunning   Status = "running"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
-	StatusCancelled Status = "cancelled"
+	StatusCancelled Status = "cancelled" //nolint:misspell // persisted job status and API value.
 )
 
 // Terminal reports whether a status is final.

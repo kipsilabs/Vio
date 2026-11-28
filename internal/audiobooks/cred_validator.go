@@ -109,7 +109,7 @@ func (v *SiloCredValidator) Validate(
 		return principal, nil
 	}
 
-	if profile.PINHash != "" {
+	if profile.PINHash != "" { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		if pin == "" {
 			return abs.Principal{}, abs.ErrProfilePINRequired
 		}

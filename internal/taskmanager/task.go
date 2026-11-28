@@ -20,7 +20,7 @@ type TaskState string
 const (
 	TaskStateIdle       TaskState = "idle"
 	TaskStateRunning    TaskState = "running"
-	TaskStateCancelling TaskState = "cancelling"
+	TaskStateCancelling TaskState = "cancelling" //nolint:misspell // persisted task state and API value.
 )
 
 // TaskCategory groups tasks for display.

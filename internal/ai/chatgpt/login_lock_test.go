@@ -40,7 +40,7 @@ func (s *loginAdmissionStore) UpdateValueAtomic(ctx context.Context, key string,
 	}
 	// Production gives a completed mutation another five seconds to commit,
 	// independently of its caller's deadline.
-	time.Sleep(5 * time.Second)
+	time.Sleep(5 * time.Second) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 	return s.memoryStore.UpdateValueAtomic(context.WithoutCancel(ctx), key, func(string) (string, error) { return next, nil })
 }
 

@@ -26,7 +26,9 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	// The stored status and the API contract use this spelling; renaming it
+	// needs a migration and a client release.
+	StatusCancelled = "cancelled" //nolint:misspell // persisted status value.
 )
 
 var (
@@ -647,7 +649,7 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 
 func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -728,7 +730,7 @@ func (r *Repository) CancelState(ctx context.Context, id string) (cancelRequeste
 
 func (r *Repository) CancelQueued(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled"
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs

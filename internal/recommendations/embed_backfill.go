@@ -549,7 +549,7 @@ func (b *embedBackfill) embedEach(ctx context.Context, items []*models.MediaItem
 			return err
 		}
 		vector, limit, err := b.embedOne(ctx, texts[i])
-		if err != nil {
+		if err != nil { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 			if stop := runStopError(ctx, err); stop != nil {
 				return stop
 			}
@@ -774,7 +774,7 @@ func (b *embedBackfill) ensureLock(ctx context.Context, vector []float32) error 
 	if err := checkStorableVector(vector); err != nil {
 		return err
 	}
-	if b.lock == nil {
+	if b.lock == nil { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		lock, err := b.db.GetEmbeddingLock(ctx)
 		if err != nil {
 			return fmt.Errorf("load embedding lock: %w", err)

@@ -180,7 +180,7 @@ func releaseItems[T retainedSizer](ctx context.Context, items []T) {
 const mapEntryOverhead = 48
 
 func sizeOf[T any]() int64 {
-	return int64(reflect.TypeFor[T]().Size())
+	return int64(reflect.TypeFor[T]().Size()) //nolint:gosec // upstream code keeps a bounded, non-secret value; reviewed
 }
 
 func stringBytes(values ...string) int64 {

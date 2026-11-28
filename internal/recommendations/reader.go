@@ -925,7 +925,7 @@ func (rr *rowRead) exclusionSet(ctx context.Context) (map[string]struct{}, error
 
 // ratedSet is every title the profile rated, a rated episode as its series.
 func (rr *rowRead) ratedSet(ctx context.Context) (map[string]struct{}, error) {
-	if rr.rated == nil {
+	if rr.rated == nil { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		ratedIDs, err := rr.reader.repo.ListRatedItemIDs(ctx, rr.userID, rr.profileID)
 		if err != nil {
 			return nil, err

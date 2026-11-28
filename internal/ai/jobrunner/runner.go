@@ -136,8 +136,8 @@ func (r *Runner) reapStaleJobs() {
 
 // Dispatch launches a bounded background goroutine for job id. run executes
 // once a semaphore slot is acquired; onAbort runs instead if the job is
-// cancelled (user cancel or shutdown) while still waiting for a slot. Both
-// receive a context derived from the application context that is cancelled by
+// canceled (user cancel or shutdown) while still waiting for a slot. Both
+// receive a context derived from the application context that is canceled by
 // Cancel(id) or server shutdown.
 func (r *Runner) Dispatch(id int64, run func(ctx context.Context), onAbort func(ctx context.Context)) {
 	queuedAt := time.Now()
@@ -247,7 +247,7 @@ func (r *Runner) Cancel(id int64) bool {
 }
 
 // heartbeatLoop keeps a job's heartbeat_at fresh until the job ends or the
-// context is cancelled, so the stale-job reaper only ever reaps jobs orphaned
+// context is canceled, so the stale-job reaper only ever reaps jobs orphaned
 // by a crashed worker.
 func (r *Runner) heartbeatLoop(ctx context.Context, jobID int64, stop <-chan struct{}, cancel context.CancelFunc) {
 	ticker := time.NewTicker(HeartbeatInterval)

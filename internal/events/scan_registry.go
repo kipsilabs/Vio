@@ -114,7 +114,7 @@ func (r *ScanRegistry) CancelLibrary(libraryID int, completedAt time.Time) []Sca
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	cancelled := make([]ScanRun, 0)
+	canceled := make([]ScanRun, 0)
 	for id, run := range r.entries {
 		if run.LibraryID != libraryID {
 			continue
@@ -125,7 +125,7 @@ func (r *ScanRegistry) CancelLibrary(libraryID int, completedAt time.Time) []Sca
 		run.Status = "cancelled"
 		run.CompletedAt = &completedAt
 		r.entries[id] = run
-		cancelled = append(cancelled, run)
+		canceled = append(canceled, run)
 	}
-	return cancelled
+	return canceled
 }

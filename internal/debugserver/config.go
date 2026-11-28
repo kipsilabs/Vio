@@ -2,6 +2,7 @@
 package debugserver
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -48,12 +49,12 @@ func samplingSetting(raw, name string, min, max int) (int, error) {
 func (c Config) validate() error {
 	if c.Listen == "" {
 		if c.BlockRate != 0 || c.MutexFraction != 0 {
-			return fmt.Errorf("contention sampling requires SILO_DEBUG_LISTEN")
+			return errors.New("contention sampling requires SILO_DEBUG_LISTEN")
 		}
 		return nil
 	}
 	if !loopbackAuthority(c.Listen) {
-		return fmt.Errorf("SILO_DEBUG_LISTEN must be a literal loopback IP and port from 1 to 65535")
+		return errors.New("SILO_DEBUG_LISTEN must be a literal loopback IP and port from 1 to 65535")
 	}
 	if c.BlockRate != 0 && (c.BlockRate < 1_000_000 || c.BlockRate > 1_000_000_000) {
 		return fmt.Errorf("invalid block sampling rate")

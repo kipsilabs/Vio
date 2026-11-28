@@ -13,7 +13,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) {
+func TestLoginActivationReconcilesModelWithoutLosingAcceptedTokens(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	key := testSigningKey(t)
 	for _, test := range []struct {
 		name, clientID, authMode                               string

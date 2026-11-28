@@ -67,7 +67,7 @@ func (b rowBuilder) clusterRows(ctx context.Context, userID int, profileID strin
 	}
 
 	for _, c := range clusters {
-		if c.Embedding == nil || len(c.Embedding) == 0 {
+		if len(c.Embedding) == 0 {
 			continue
 		}
 

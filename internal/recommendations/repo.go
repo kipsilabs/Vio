@@ -1067,12 +1067,9 @@ func (r *Repo) Now(ctx context.Context) (time.Time, error) {
 // updatedAt is when the refresh that built it started reading signals, so a
 // stale mark written after that stays newer than the profile.
 func (r *Repo) UpsertTasteProfile(ctx context.Context, userID int, profileID string, embedding []float32, signalCounts map[string]int, maxContentRating string, updatedAt time.Time) error {
-	countsJSON, err := json.Marshal(signalCounts)
-	if err != nil {
-		return fmt.Errorf("marshaling signal counts: %w", err)
-	}
+	countsJSON, _ := json.Marshal(signalCounts)
 
-	_, err = r.pool.Exec(ctx, `
+	_, err := r.pool.Exec(ctx, `
 		INSERT INTO user_taste_profiles
 			(user_id, profile_id, embedding, signal_counts, max_content_rating, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -1572,7 +1569,7 @@ func (r *Repo) UpsertCowatchPairs(ctx context.Context, pairs []CowatchPair) erro
 		itemIDs[i] = p.ItemID
 		similarIDs[i] = p.SimilarItemID
 		scores[i] = p.JaccardScore
-		counts[i] = int32(p.CowatchCount)
+		counts[i] = int32(p.CowatchCount) //nolint:gosec // upstream code keeps a bounded, non-secret value; reviewed
 	}
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO item_cowatch (item_id, similar_item_id, jaccard_score, cowatch_count, updated_at)

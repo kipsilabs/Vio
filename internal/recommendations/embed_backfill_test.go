@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -183,7 +184,7 @@ func testIDs(prefix string, n int) []string {
 // model: the run fails and writes neither the lock nor any row.
 func TestBackfillUnstorableVectorWritesNoLock(t *testing.T) {
 	for _, dims := range []int{0, CanonicalEmbeddingDimensions + 1} {
-		t.Run(fmt.Sprint(dims), func(t *testing.T) {
+		t.Run(strconv.Itoa(dims), func(t *testing.T) {
 			calls := 0
 			store := newFakeEmbeddingStore(testIDs("item-", 3)...)
 			b := newTestBackfill(store, quotaTestEmbedder(func(_ context.Context, texts []string) ([][]float32, error) {
@@ -264,7 +265,7 @@ func TestBackfillLocksImportedEmbeddings(t *testing.T) {
 	}
 }
 
-var testRefusal = &embeddings.StatusError{API: "embedding", StatusCode: 400, Body: "invalid input"}
+var errTestRefusal = &embeddings.StatusError{API: "embedding", StatusCode: 400, Body: "invalid input"}
 
 // refusingEmbedder answers a call with testRefusal when bad reports one of
 // its texts, and counts its calls.

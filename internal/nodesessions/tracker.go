@@ -408,7 +408,7 @@ func (tr *Tracker) Cleanup(ctx context.Context) {
 }
 
 // StartRefresh starts a background goroutine that refreshes TTLs for all
-// active sessions every 30 seconds. Stops when ctx is cancelled.
+// active sessions every 30 seconds. Stops when ctx is canceled.
 func (tr *Tracker) StartRefresh(ctx context.Context) {
 	if tr.rdb == nil {
 		return

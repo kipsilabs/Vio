@@ -597,7 +597,7 @@ func (e *Enricher) enrichItem(ctx context.Context, item enrichmentItemRow) error
 	// Nothing found.
 	if !accumulator.HasMetadata && accumulator.PosterPath == "" && accumulator.Overview == "" {
 		if err := ctx.Err(); err != nil {
-			// A cancelled sweep says nothing about the item or the providers.
+			// A canceled sweep says nothing about the item or the providers.
 			return err
 		}
 		if len(providerErrs) > 0 {
@@ -1052,7 +1052,7 @@ func (e *Enricher) resolvePeople(ctx context.Context, people []models.ItemPerson
 			continue
 		}
 		ip := people[i]
-		ip.Person.ID = personIDs[i]
+		ip.ID = personIDs[i]
 		linked = append(linked, ip)
 	}
 	return linked, nil

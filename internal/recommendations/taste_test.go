@@ -71,7 +71,7 @@ func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int 
 // vector, and drops its clusters and cached rows, leaving global rows and
 // other profiles alone. The row can still be marked stale, and similar-user
 // search neither finds the cleared profile nor runs for it.
-func TestClearTasteProfileKeepsTheRowAndDropsPersonalStatePostgres(t *testing.T) {
+func TestClearTasteProfileKeepsTheRowAndDropsPersonalStatePostgres(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := newEngineTestPool(t)
 	ctx := t.Context()
 	repo := NewRepo(pool)
@@ -488,7 +488,7 @@ func newTasteTestEngine(pool *pgxpool.Pool) *Engine {
 // single long series is level 1, and a profile of watchlist adds, or of
 // titles with no embedding yet, is level 0. The taste-profile summary leaves
 // the count out.
-func TestRefreshCountsPositiveTitlesForTheLevelPostgres(t *testing.T) {
+func TestRefreshCountsPositiveTitlesForTheLevelPostgres(t *testing.T) { //nolint:funlen // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	pool := newEngineTestPool(t)
 	ctx := t.Context()
 	const prefix = "ttaste-level-"

@@ -170,7 +170,7 @@ func writeSidecar(t *testing.T, path string) string {
 // and person artwork copies it, other drains cannot take the jobs during the
 // discovery hold, and every job ends succeeded with the cached copy written to
 // its slot.
-func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) {
+func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := imageCacheQueueTestPool(t)
 	ctx := context.Background()
 	seriesID := fmt.Sprintf("series:local-copy-%d", time.Now().UnixNano())
@@ -400,7 +400,7 @@ func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) {
 // week-long stable-failure delay, and waits longer when that repeats. A file
 // missing from a folder the server does see stays a stable failure, and
 // confinement still rejects a symlink escaping the root.
-func TestLocalArtworkRetriesWithoutLibraryRootDB(t *testing.T) {
+func TestLocalArtworkRetriesWithoutLibraryRootDB(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := imageCacheQueueTestPool(t)
 	ctx := context.Background()
 

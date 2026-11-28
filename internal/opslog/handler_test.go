@@ -131,7 +131,7 @@ func TestHandlerRecordsErrorText(t *testing.T) {
 	}
 }
 
-type nilPtrErr struct{ msg string }
+type nilPtrError struct{ msg string }
 
 func (e *nilPtrErr) Error() string { return e.msg }
 

@@ -500,7 +500,7 @@ func (h *Handler) mirrorSessionSync(ctx context.Context, a ctxAuth, sess ABSPlay
 }
 
 // handleSessionClose — POST /abs/api/session/{sid}/close
-// Finalises a play session. Sets closed_at on the abs_playback_sessions row.
+// Finalizes a play session. Sets closed_at on the abs_playback_sessions row.
 // Only the owning user may close their session (IDOR guard).
 //
 // A body is the client's final sync, as in ABS SessionController.close: it is
@@ -593,7 +593,7 @@ func (h *Handler) audiobookVisible(ctx context.Context, a ctxAuth, contentID str
 }
 
 // ---------------------------------------------------------------------------
-// Serialisation helpers
+// Serialization helpers
 // ---------------------------------------------------------------------------
 
 // progressRowToABS shapes a ProgressRow into the ABS /me/progress wire format.

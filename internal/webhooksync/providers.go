@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -118,7 +119,7 @@ func (p *PlexProvider) ParseWebhook(ctx context.Context, conn *Connection, r *ht
 		return nil, fmt.Errorf("invalid Plex payload")
 	}
 	if payload.Event == "" {
-		return nil, fmt.Errorf("invalid Plex webhook payload")
+		return nil, errors.New("invalid Plex webhook payload")
 	}
 	action, completed, ok := plexWebhookAction(payload.Event)
 	if !ok {
@@ -131,7 +132,7 @@ func (p *PlexProvider) ParseWebhook(ctx context.Context, conn *Connection, r *ht
 	// Only the events Silo applies need an account and an item. Plex sends
 	// every event to every webhook, including server events without an item.
 	if payload.Account.ID == 0 || payload.Metadata.RatingKey == "" || payload.Metadata.Type == "" {
-		return nil, fmt.Errorf("invalid Plex webhook payload")
+		return nil, errors.New("invalid Plex webhook payload")
 	}
 	userID := strconv.FormatInt(payload.Account.ID, 10)
 	// A playback start only needs the account and item IDs, so it is recorded
@@ -250,7 +251,7 @@ func (p *EmbyProvider) ParseWebhook(_ context.Context, conn *Connection, r *http
 	}
 	eventName := strings.ToLower(strings.TrimSpace(payload.Event))
 	if eventName == "" {
-		return nil, fmt.Errorf("invalid Emby webhook payload")
+		return nil, errors.New("invalid Emby webhook payload")
 	}
 	action, ok := embyWebhookAction(eventName)
 	if !ok {
@@ -263,7 +264,7 @@ func (p *EmbyProvider) ParseWebhook(_ context.Context, conn *Connection, r *http
 	// Only the events Silo applies need a user and an item. The Test
 	// Notification and server events carry neither.
 	if payload.User.ID == "" || payload.Item.ID == "" || payload.Item.Type == "" {
-		return nil, fmt.Errorf("invalid Emby webhook payload")
+		return nil, errors.New("invalid Emby webhook payload")
 	}
 	record, mediaKind, ok := embyLikeRecord(payload.Item.Type, payload.Item.Name, payload.Item.SeriesName, payload.Item.ProductionYear, payload.Item.IndexNumber, payload.Item.ParentIndexNumber, payload.Item.RunTimeTicks, payload.PlaybackInfo.PositionTicks, payload.PlaybackInfo.PlayedToCompletion || action == ActionImportProgress && isEmbyMarkPlayedEvent(eventName), payload.Item.ProviderIDs, payload.Item.ID, payload.Date, actionAllowsSeries(action))
 	if !ok {
@@ -695,7 +696,7 @@ func isEmbyFavoriteRemovedEvent(eventName string) bool {
 }
 
 func containsEmbyFavoriteToken(eventName string) bool {
-	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite")
+	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite") //nolint:misspell // provider event spelling.
 }
 
 func actionAllowsSeries(action string) bool {

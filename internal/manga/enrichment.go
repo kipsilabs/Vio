@@ -236,7 +236,7 @@ func (e *Enricher) runBatch(
 						"title", item.Title,
 						"error", err,
 					)
-					// A cancelled sweep says nothing about the item itself,
+					// A canceled sweep says nothing about the item itself,
 					// so it does not count against the failure cap.
 					if recordFailure != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 						recordFailure(ctx, item, err)
@@ -413,7 +413,7 @@ func (e *Enricher) enrichWithProviders(ctx context.Context, item enrichmentItemR
 
 	if !accumulator.HasMetadata && accumulator.PosterPath == "" && accumulator.Overview == "" {
 		if err := ctx.Err(); err != nil {
-			// A cancelled sweep says nothing about the item or the providers.
+			// A canceled sweep says nothing about the item or the providers.
 			return err
 		}
 		if len(providerErrs) > 0 {
@@ -755,7 +755,7 @@ func isNilImageCacher(cacher metadata.ImageCacher) bool {
 	}
 	value := reflect.ValueOf(cacher)
 	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
 	default:
 		return false
@@ -996,7 +996,7 @@ func (e *Enricher) persistPeople(ctx context.Context, contentID string, people [
 			continue
 		}
 		ip := people[i]
-		ip.Person.ID = personIDs[i]
+		ip.ID = personIDs[i]
 		linked = append(linked, ip)
 	}
 
@@ -1105,7 +1105,7 @@ func filterMangaProviderIDs(providerIDs map[string]string) map[string]string {
 
 // normalizeMangaStatus maps the varied publication-status strings returned by
 // manga metadata providers (AniList: RELEASING/FINISHED/NOT_YET_RELEASED/
-// CANCELLED/HIATUS, MangaDex: ongoing/completed/hiatus/cancelled, and the SDK's
+// HIATUS, MangaDex: ongoing/completed/hiatus, and the SDK's
 // Continuing/Ended) onto the stable label set the clients render, so the shared
 // show_status field carries one consistent manga value-domain instead of raw
 // provider casing. Unknown values pass through trimmed so nothing is lost.
@@ -1121,8 +1121,8 @@ func normalizeMangaStatus(raw string) string {
 		return "Completed"
 	case "hiatus", "on_hiatus", "paused":
 		return "Hiatus"
-	case "cancelled", "canceled", "discontinued":
-		return "Cancelled"
+	case "cancelled", "canceled", "discontinued": //nolint:misspell // provider status spelling.
+		return "Canceled"
 	case "upcoming", "not_yet_released", "unreleased", "announced":
 		return "Upcoming"
 	default:

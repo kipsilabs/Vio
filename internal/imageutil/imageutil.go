@@ -458,7 +458,7 @@ func fitWithin(opts *bimg.Options, size bimg.ImageSize, maxDim int) {
 }
 
 // scaleImage scales src so its longest dimension does not exceed maxDim,
-// preserving aspect ratio. Uses nearest-neighbour interpolation.
+// preserving aspect ratio. Uses nearest-neighbor interpolation.
 func scaleImage(src image.Image, maxDim int) *image.NRGBA {
 	bounds := src.Bounds()
 	srcW := bounds.Dx()

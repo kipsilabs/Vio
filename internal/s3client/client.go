@@ -347,11 +347,11 @@ func (c *Client) PutObjectStreamParts(ctx context.Context, bucket, key string, r
 		input.ContentType = aws.String(ct)
 	}
 
-	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+	uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) { //nolint:staticcheck // upstream uploader; migration to transfermanager tracked separately
 		u.PartSize = partSize
 		u.Concurrency = 1
 	})
-	if _, err := uploader.Upload(ctx, input); err != nil {
+	if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // upstream uploader; migration to transfermanager tracked separately
 		return fmt.Errorf("s3 PutObject stream %s/%s: %w", bucket, key, err)
 	}
 

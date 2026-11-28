@@ -281,7 +281,7 @@ func normalizeImageCacheJobInput(in EnqueueImageCacheJobInput) (EnqueueImageCach
 	return in, true
 }
 
-func (r *ImageCacheJobRepository) enqueueBatchChunk(ctx context.Context, inputs []EnqueueImageCacheJobInput, requeueSucceeded bool, hold time.Duration, queued *[]EnqueueImageCacheJobInput) (int, error) {
+func (r *ImageCacheJobRepository) enqueueBatchChunk(ctx context.Context, inputs []EnqueueImageCacheJobInput, requeueSucceeded bool, hold time.Duration, queued *[]EnqueueImageCacheJobInput) (int, error) { //nolint:funlen // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	var sql strings.Builder
 	args := make([]any, 0, len(inputs)*11+2)
 	// Arg 1 is the hold. Rows re-queued by the conflict branch below take the
@@ -723,7 +723,7 @@ func (r *ImageCacheJobRepository) MarkFailed(ctx context.Context, id int64, atte
 }
 
 // RequeueClaimed returns claimed-but-unprocessed jobs to the queue without
-// burning a retry attempt. Used when a run is cancelled before its workers
+// burning a retry attempt. Used when a run is canceled before its workers
 // start, so the jobs do not sit locked until the lease expires.
 func (r *ImageCacheJobRepository) RequeueClaimed(ctx context.Context, ids []int64, workerID string) error {
 	if r == nil || r.pool == nil || len(ids) == 0 {

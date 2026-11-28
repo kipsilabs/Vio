@@ -105,7 +105,7 @@ func (r *PgRepository) ListJobsByContent(ctx context.Context, contentID string) 
 
 // UpdateProgress, CompleteJob, and FailJob only transition a job that is still
 // active ("pending"/"running"). The guard makes them no-ops on an already
-// terminal row, so a job that was cancelled or reaped as stale can never be
+// terminal row, so a job that was canceled or reaped as stale can never be
 // resurrected by a late write from its own worker goroutine.
 func (r *PgRepository) UpdateProgress(ctx context.Context, id int64, status JobStatus, progress float64, message string, fieldsDone, fieldsTotal int) error {
 	_, err := r.pool.Exec(ctx,

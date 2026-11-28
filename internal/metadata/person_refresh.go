@@ -186,10 +186,10 @@ func (s *PersonRefreshService) resolveProviders(ctx context.Context) ([]Provider
 // duplicate lookup this avoids.
 func (s *PersonRefreshService) RefreshPersonUnlessStartedSince(ctx context.Context, id int64, since time.Time) (*models.Person, error) {
 	if s.repo == nil {
-		return nil, fmt.Errorf("person refresh repository is not configured")
+		return nil, errors.New("person refresh repository is not configured")
 	}
 	if s.pluginResolver == nil || s.pool == nil {
-		return nil, fmt.Errorf("person refresh providers are not configured")
+		return nil, errors.New("person refresh providers are not configured")
 	}
 	return s.refreshPerson(ctx, id, s.resolveProviders, since)
 }
@@ -224,7 +224,7 @@ func (s *PersonRefreshService) refreshPersonSince(
 // started after it. resolve supplies the providers once the attempt is
 // recorded, so a failure to resolve them is a failed lookup that backs off
 // like any other.
-func (s *PersonRefreshService) refreshPerson(
+func (s *PersonRefreshService) refreshPerson( //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	ctx context.Context,
 	id int64,
 	resolve func(context.Context) ([]Provider, error),

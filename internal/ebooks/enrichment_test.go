@@ -255,10 +255,10 @@ func TestMergeEbookAuthorCreditsPreservesOtherPeopleKinds(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("merged people len = %d, want 2: %+v", len(got), got)
 	}
-	if got[0].Person.ID != 20 || got[0].Kind != models.PersonKindWriter || got[0].Character != "essay" || got[0].SortOrder != 0 {
+	if got[0].ID != 20 || got[0].Kind != models.PersonKindWriter || got[0].Character != "essay" || got[0].SortOrder != 0 {
 		t.Fatalf("preserved non-author credit = %+v", got[0])
 	}
-	if got[1].Person.ID != 40 || got[1].Kind != models.PersonKindAuthor || got[1].SortOrder != 1 {
+	if got[1].ID != 40 || got[1].Kind != models.PersonKindAuthor || got[1].SortOrder != 1 {
 		t.Fatalf("provider author credit = %+v", got[1])
 	}
 }

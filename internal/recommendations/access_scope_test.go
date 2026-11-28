@@ -173,7 +173,7 @@ func TestNotifyUnratedContentChangedMarksTwice(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("no second mark after the settle delay")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 	}
 	assertNothingQueued(t, w, "after an unrated content change")
 

@@ -361,7 +361,7 @@ func (s *Service) executeRunWithClaim(run *Run, provider Provider, claim RunClai
 	defer cancel(nil)
 
 	// Wait for a concurrency slot. The run stays in "queued" status until
-	// a slot opens. If the context is cancelled (server shutdown or admin
+	// a slot opens. If the context is canceled (server shutdown or admin
 	// cancel), the goroutine exits without executing.
 	if !capacityHeld {
 		select {

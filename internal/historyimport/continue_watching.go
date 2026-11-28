@@ -249,7 +249,7 @@ func (s *Service) reconcileContinueWatching(ctx context.Context, userID int, pro
 			stats.listed++
 			continue
 		}
-		if !show.inProgress && !(row.IncludesNextUp && show.unfinished) {
+		if !show.inProgress && (!row.IncludesNextUp || !show.unfinished) {
 			stats.settled++
 			continue
 		}

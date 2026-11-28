@@ -157,7 +157,7 @@ func (f *fakeSheets) exec(_ context.Context, _ string, args []string, stdin io.R
 					continue
 				}
 				at := int64(math.Round(key * 1000))
-				timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1)
+				timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n0, %d, %d, 1, 1, 0x00000000, F=0x0\n", at, at, at+1, at+1) //nolint:perfsprint // fixture assembly; readability over allocation
 			}
 			timing += fmt.Sprintf("0, %d, %d, 1, 1, 0x00000000\n", end-1, end-1)
 		}

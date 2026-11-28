@@ -25,11 +25,11 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	StatusCancelled = "cancelled" //nolint:misspell // persisted scan run status.
 	// StatusCancelledLegacy is the durable single-L spelling older builds
 	// wrote for a canceled run. The v2 admin surface keeps enumerating it so a
 	// client filtering by the old value still finds pre-change rows.
-	StatusCancelledLegacy = "canceled" //nolint:misspell // legacy column spelling
+	StatusCancelledLegacy = "canceled"
 
 	TriggerAdminItemRefresh    = "admin_item_refresh"
 	TriggerAdminLibraryRefresh = "admin_library_refresh"

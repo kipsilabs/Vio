@@ -17,7 +17,7 @@ const (
 	RunStatusRunning   = "running"
 	RunStatusCompleted = "completed"
 	RunStatusFailed    = "failed"
-	RunStatusCancelled = "cancelled"
+	RunStatusCancelled = "cancelled" //nolint:misspell // persisted run status and API value.
 
 	KindMovie   = "movie"
 	KindSeries  = "series"

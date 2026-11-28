@@ -6,8 +6,8 @@ import (
 )
 
 // CancelRegistry bridges HTTP cancellation requests to in-process job contexts.
-// Queued jobs are cancelled in the repository; running jobs need their active
-// context cancelled so executors stop doing work before the row is finalized.
+// Queued jobs are canceled in the repository; running jobs need their active
+// context canceled so executors stop doing work before the row is finalized.
 type CancelRegistry struct {
 	mu      sync.Mutex
 	cancels map[string]cancelEntry

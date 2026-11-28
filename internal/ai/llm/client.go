@@ -406,7 +406,7 @@ func Truncate(s string, maxLen int) string {
 	return s
 }
 
-// sleepCtx waits for d or until ctx is cancelled.
+// sleepCtx waits for d or until ctx is canceled.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	select {
 	case <-ctx.Done():
