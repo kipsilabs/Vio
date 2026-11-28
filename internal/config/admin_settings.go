@@ -727,8 +727,6 @@ var adminSettingDefaults = map[string]string{
 	"email.smtp_security": "starttls",
 	"email.from_name":     "Vio",
 
-	"notifications.release_events_enabled":                     "true",
-	"notifications.fanout_enabled":                             "true",
 	"notifications.ui_enabled":                                 "true",
 	"notifications.fanout.settle_seconds":                      "30",
 	"notifications.fanout.max_series_burst":                    "3",
@@ -949,7 +947,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"email.enabled", "signup.enabled", "password_reset.self_service_enabled", SetupCompletedSettingKey,
 		"scanner.empty_trash_after_scan", "scanner.realtime_monitoring", "matcher.enable_tv_series_root_queue",
 		"matcher.enable_tv_series_group_queue", "policy.editor_enabled",
-		"overlays.enabled", "notifications.release_events_enabled", "notifications.fanout_enabled",
+		"overlays.enabled",
 		"notifications.ui_enabled", "notifications.webhooks_enabled",
 		"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
 		"notifications.email_enabled",

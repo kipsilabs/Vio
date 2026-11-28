@@ -225,6 +225,7 @@ var restoredFlagColumns = map[string]string{
 	"local_metadata_default_on_chain_backup.up_enabled":       whyMigration,
 	"marker_contributions.claim_active":                       whyQueue,
 	"marker_provider_config.fetch_enabled":                    "fetching markers sends nothing of the server's",
+	"media_files.copy_safety_multi":                           whyFacts,
 	"media_files.hdr":                                         whyFacts,
 	"media_files.multiple_pps":                                whyFacts,
 	"media_folders.allow_empty_cleanup_once":                  "a one-shot scan instruction",

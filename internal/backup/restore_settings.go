@@ -222,6 +222,20 @@ var settingRulesByPage = []struct {
 	{"nodes", map[string]SettingClass{
 		"playback.routing.": SettingPortable,
 	}},
+	{"streaming", map[string]SettingClass{
+		"virtual_library.allow_insecure_http":   SettingPortable,
+		"virtual_library.allow_private_streams": SettingPortable,
+		"virtual_library.movie_library_id":      SettingServerSpecific,
+		"virtual_library.series_library_id":     SettingServerSpecific,
+		"virtual_library.monitor_file":          SettingServerSpecific,
+		"virtual_library.altmount_url":          SettingExternalService,
+		"virtual_library.altmount_api_key":      SettingExternalService,
+		"virtual_library.indexer_rss_url":       SettingExternalService,
+		"virtual_library.indexer_api_key":       SettingExternalService,
+		"virtual_library.manifest_url":          SettingExternalService,
+		"virtual_library.tmdb_api_key":          SettingExternalService,
+		"virtual_library.":                      SettingPortable,
+	}},
 	{pageBackups, map[string]SettingClass{
 		"backup.": SettingServerSpecific,
 	}},

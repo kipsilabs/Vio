@@ -52,6 +52,7 @@ var serverSpecificSettings = append(strings.Fields(`
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation
 	media_images. chapter_thumbnails. ui.dashboard.hidden_attention
+	virtual_library.movie_library_id virtual_library.series_library_id virtual_library.monitor_file
 	direct_connections.
 `), plugins.ProvisionRestoreHoldKey)
 
@@ -66,7 +67,7 @@ var restoredSettings = strings.Fields(`
 	download. requests. tmdb. mdblist. introdb.
 	ai. subtitle_ai. metadata_ai. email. discord. notifications.
 	jellyfin_compat. audiobookshelf_compat. recommendations.
-	watchsync. taskmanager. autoscan.
+	watchsync. taskmanager. autoscan. virtual_library.
 `)
 
 // Reasons a switch setting is restored as the backup has it.
@@ -105,10 +106,16 @@ var restoredFlagSettings = map[string]string{
 	"playback.transcode_enabled":                           "transcoding capacity: it changes how a permitted stream plays, not who may play",
 	"playback.transcode_hardware_tone_map_enabled":         whyLocal,
 	"playback.transcode_software_tone_map_enabled":         whyLocal,
+	"playback.transcode_vpp_tone_map_enabled":              whyLocal,
 	"policy.editor_enabled":                                "the admin policy editor; admins only",
 	"scanner.empty_trash_after_scan":                       "catalog upkeep",
 	"scanner.realtime_monitoring":                          whyLocal,
 	"subtitles.auto_sync":                                  whyLocal,
+	"virtual_library.discover_before_playback":             whyTuning,
+	"virtual_library.enable_quality_profiles":              whyTuning,
+	"virtual_library.enabled":                              whyLocal,
+	"virtual_library.fallback_to_any_stream":               whyTuning,
+	"virtual_library.single_stream_with_failover":          whyTuning,
 }
 
 // SettingKindOf is key's kind: a stricter or route setting by its table,
