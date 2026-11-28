@@ -183,7 +183,7 @@ func nodeDependencyOperations(t *testing.T, operation string) float64 {
 	}
 	var total float64
 	for _, family := range families {
-		if family.GetName() != "vio_dependency_operations_total" {
+		if family.GetName() != "silo_dependency_operations_total" {
 			continue
 		}
 		for _, metric := range family.GetMetric() {
