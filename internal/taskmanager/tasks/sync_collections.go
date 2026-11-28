@@ -44,7 +44,17 @@ func (t *SyncCollectionsTask) DefaultTriggers() []taskmanager.TriggerConfig {
 func (t *SyncCollectionsTask) Execute(ctx context.Context, progress taskmanager.ProgressReporter) error {
 	progress.Report(0, "Checking for due collections")
 
-	resultData, err := t.scheduler.RunOnce(ctx, nil)
+	resultData, err := t.scheduler.RunOnce(ctx, func(p catalog.CollectionSyncProgress) {
+		if p.Due <= 0 {
+			return
+		}
+		percent := float64(p.Completed) / float64(p.Due) * 100
+		message := fmt.Sprintf("Synced %d of %d", p.Completed, p.Due)
+		if p.CurrentTitle != "" {
+			message += ": " + p.CurrentTitle
+		}
+		progress.Report(percent, message)
+	})
 	if err != nil {
 		return fmt.Errorf("collection sync scheduler: %w", err)
 	}
