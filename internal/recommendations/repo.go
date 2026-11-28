@@ -232,7 +232,7 @@ func (r *Repo) withHNSWCandidateScan(ctx context.Context, fn func(pgx.Tx) error)
 	if err != nil {
 		return fmt.Errorf("begin hnsw candidate scan tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Each scan is planned for its own arguments. A connection's cached
 	// statement can otherwise switch to a generic plan, which cannot see how
@@ -1457,7 +1457,7 @@ func (r *Repo) UpsertTasteClusters(ctx context.Context, userID int, profileID st
 	if err != nil {
 		return fmt.Errorf("begin tx for taste clusters: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := lockTasteClusters(ctx, tx, userID, profileID); err != nil {
 		return err

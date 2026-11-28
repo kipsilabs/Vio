@@ -192,7 +192,7 @@ func (r *Refresher) fetchAndParse(ctx context.Context, feedURL string) (*gofeed.
 	if err != nil {
 		return nil, fmt.Errorf("fetch %q: %w", feedURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetch %q: status %d", feedURL, resp.StatusCode)
 	}

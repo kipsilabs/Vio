@@ -641,7 +641,7 @@ func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
 	ctx := context.Background()
 
 	seriesID := "series-daily-ambiguous"
-	h.itemRepo.Upsert(ctx, &models.MediaItem{
+	_ = h.itemRepo.Upsert(ctx, &models.MediaItem{
 		ContentID: seriesID,
 		Title:     "Two A Day",
 		Type:      "series",
@@ -651,7 +651,7 @@ func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
 		Countries: []string{},
 		Genres:    []string{},
 	})
-	h.episodeRepo.Upsert(ctx, &models.Episode{
+	_ = h.episodeRepo.Upsert(ctx, &models.Episode{
 		ContentID:      "ep-one",
 		SeriesID:       seriesID,
 		SeasonID:       "season-1",
@@ -660,7 +660,7 @@ func TestEnsureSeriesEpisodeLinks_SkipsAmbiguousAirDateMatch(t *testing.T) {
 		AirDate:        mustDate(t, "2026-04-24"),
 		MetadataSource: "provider",
 	})
-	h.episodeRepo.Upsert(ctx, &models.Episode{
+	_ = h.episodeRepo.Upsert(ctx, &models.Episode{
 		ContentID:      "ep-two",
 		SeriesID:       seriesID,
 		SeasonID:       "season-1",
@@ -853,7 +853,7 @@ func TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes(t *testing.
 	seriesID := "series-partial-1"
 
 	// Create the series item (already matched).
-	h.itemRepo.Upsert(ctx, &models.MediaItem{
+	_ = h.itemRepo.Upsert(ctx, &models.MediaItem{
 		ContentID: seriesID,
 		Title:     "Partial Show",
 		Type:      "series",
@@ -865,14 +865,14 @@ func TestFallbackEpisode_PartialProviderCoverageKeepsScannerEpisodes(t *testing.
 	})
 
 	// Provider supplied S01E01 only.
-	h.seasonRepo.Upsert(ctx, &models.Season{
+	_ = h.seasonRepo.Upsert(ctx, &models.Season{
 		ContentID:      "season-provider-1",
 		SeriesID:       seriesID,
 		SeasonNumber:   1,
 		Title:          "Season 1",
 		MetadataSource: "provider",
 	})
-	h.episodeRepo.Upsert(ctx, &models.Episode{
+	_ = h.episodeRepo.Upsert(ctx, &models.Episode{
 		ContentID:      "ep-provider-s01e01",
 		SeriesID:       seriesID,
 		SeasonID:       "season-provider-1",

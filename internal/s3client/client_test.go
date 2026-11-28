@@ -149,7 +149,7 @@ func newS3TestServer(t *testing.T) *s3TestServer {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
 			prefix := r.URL.Query().Get("prefix")
-			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+			_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Contents><Key>%s/export.json.gz</Key><Size>123</Size></Contents>
 </ListBucketResult>`, prefix)

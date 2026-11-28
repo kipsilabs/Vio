@@ -257,7 +257,7 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if isInsufficientQuota(respBody) {
@@ -293,7 +293,7 @@ func (c *Client) embedOpenAI(ctx context.Context, texts []string) ([][]float32, 
 		// Non-retryable error (4xx except 429).
 		return nil, &StatusError{API: "embedding", StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var embResp embeddingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embResp); err != nil {
@@ -370,7 +370,7 @@ func (c *Client) embedGemini(ctx context.Context, texts []string) ([][]float32, 
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			limitErr, retryDelay := parseGeminiRateLimit(respBody)
@@ -405,7 +405,7 @@ func (c *Client) embedGemini(ctx context.Context, texts []string) ([][]float32, 
 
 		return nil, &StatusError{API: "gemini embedding", StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var gresp geminiEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&gresp); err != nil {

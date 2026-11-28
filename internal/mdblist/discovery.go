@@ -125,7 +125,7 @@ func (c *Client) fetchLists(ctx context.Context, path string, q url.Values) ([]L
 	if err != nil {
 		return nil, fmt.Errorf("calling mdblist: %w", sanitizeAPIKeyError(err, sentKey))
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
 		return nil, fmt.Errorf("mdblist rejected apikey (status %d)", res.StatusCode)
 	}

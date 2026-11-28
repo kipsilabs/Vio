@@ -153,7 +153,7 @@ func mediaBasename(mediaFile string) string {
 // names case-insensitively, so Poster.JPG and Folder.jpg are found on
 // case-sensitive filesystems too.
 type sidecarFinder struct {
-	ctx context.Context
+	ctx context.Context //nolint:containedctx // A per-request finder caches directory listings under the caller's context.
 	// listings maps a directory to its entries keyed by lower-cased name. A
 	// name can map to several entries that differ only in case. A directory
 	// that exists but cannot be listed maps to nil.

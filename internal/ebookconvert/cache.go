@@ -46,7 +46,7 @@ type SourceKey struct {
 
 func (k SourceKey) hash() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "v1|mod=%s|id=%d|sz=%d|mt=%d|ck=%s",
+	_, _ = fmt.Fprintf(h, "v1|mod=%s|id=%d|sz=%d|mt=%d|ck=%s",
 		moduleVersion, k.FileID, k.Size, k.ModTimeNano, k.Checksum)
 	return hex.EncodeToString(h.Sum(nil))
 }

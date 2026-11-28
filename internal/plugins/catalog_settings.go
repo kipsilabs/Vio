@@ -28,7 +28,7 @@ func (s *RepositoryStore) ReconcileManaged(ctx context.Context) (ManagedReposito
 	if err != nil {
 		return ManagedRepositoryReconcileResult{}, fmt.Errorf("begin managed plugin repository reconciliation: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO server_settings (key, value)

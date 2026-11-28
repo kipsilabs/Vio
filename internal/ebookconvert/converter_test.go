@@ -121,13 +121,13 @@ func assertValidEpub(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("open epub: %v", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	if len(zr.File) == 0 || zr.File[0].Name != "mimetype" {
 		t.Fatalf("first entry not mimetype")
 	}
 	rc, _ := zr.File[0].Open()
 	mt, _ := io.ReadAll(rc)
-	rc.Close()
+	_ = rc.Close()
 	if strings.TrimSpace(string(mt)) != "application/epub+zip" {
 		t.Fatalf("bad mimetype %q", mt)
 	}

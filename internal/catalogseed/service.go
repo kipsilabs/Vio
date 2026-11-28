@@ -970,7 +970,7 @@ func decodeBundle(r io.Reader) (*Bundle, error) {
 		}
 		return nil, fmt.Errorf("%w: opening catalog seed bundle: %v", ErrInvalidBundle, err) //nolint:errorlint // the sentinel is the verdict on an uploaded bundle; the decode error is only reported
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	unpacked := &readErrorRecorder{r: gz}
 	var bundle Bundle

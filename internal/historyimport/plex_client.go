@@ -602,7 +602,7 @@ func (c *PlexClient) doJSONWithBudget(req *http.Request, out any, budget *listin
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readUpstreamErrorBody(resp.Body)
 		return &plexHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}

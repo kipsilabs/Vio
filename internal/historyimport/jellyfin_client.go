@@ -384,7 +384,7 @@ func (c *JellyfinClient) doJSONWithBudget(req *http.Request, out any, budget *li
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readUpstreamErrorBody(resp.Body)
 		return &jellyfinHTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}

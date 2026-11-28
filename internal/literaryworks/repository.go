@@ -648,7 +648,7 @@ func (r *Repository) LinkItems(ctx context.Context, workID string, items []LinkI
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	for _, item := range items {
 		if item.Confidence == 0 {
 			item.Confidence = 1

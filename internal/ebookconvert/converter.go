@@ -174,7 +174,7 @@ func (c *Converter) Convert(ctx context.Context, srcPath, dstPath string) error 
 	if err != nil {
 		return fmt.Errorf("%w: scratch: %v", ErrConversionFailed, err) //nolint:errorlint // callers and the negative cache classify by the verdict sentinel; the cause is only reported
 	}
-	defer os.RemoveAll(scratch)
+	defer func() { _ = os.RemoveAll(scratch) }()
 
 	inDir := filepath.Join(scratch, "in")
 	outDir := filepath.Join(scratch, "out")
@@ -287,7 +287,7 @@ func validateEpub(path string) error {
 	if err != nil {
 		return fmt.Errorf("open epub: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 
 	if len(zr.File) == 0 {
 		return errors.New("empty epub")
@@ -304,7 +304,7 @@ func validateEpub(path string) error {
 		return fmt.Errorf("read mimetype: %w", err)
 	}
 	mt, err := io.ReadAll(io.LimitReader(rc, 64))
-	rc.Close()
+	_ = rc.Close()
 	if err != nil {
 		return fmt.Errorf("read mimetype: %w", err)
 	}
@@ -339,7 +339,7 @@ func opfRootfile(zr *zip.ReadCloser) (string, error) {
 			return "", fmt.Errorf("open container.xml: %w", err)
 		}
 		data, err := io.ReadAll(io.LimitReader(rc, 64<<10))
-		rc.Close()
+		_ = rc.Close()
 		if err != nil {
 			return "", fmt.Errorf("read container.xml: %w", err)
 		}
@@ -409,13 +409,13 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	return out.Close()
@@ -437,12 +437,12 @@ func moveFile(src, dst string) error {
 	tmpName := tmp.Name()
 	in, err := fspath.Open(src)
 	if err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	_, copyErr := io.Copy(tmp, in)
-	in.Close()
+	_ = in.Close()
 	if copyErr == nil {
 		copyErr = tmp.Sync()
 	}
@@ -450,11 +450,11 @@ func moveFile(src, dst string) error {
 		copyErr = cerr
 	}
 	if copyErr != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return copyErr
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Remove(src)

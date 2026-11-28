@@ -193,7 +193,7 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) ([]byte, err
 		}
 		return nil, fmt.Errorf("s3 GetObject %s/%s: %w", bucket, key, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {
@@ -386,7 +386,7 @@ func (c *Client) UploadFile(ctx context.Context, bucket, key, path, contentType 
 	if err != nil {
 		return 0, fmt.Errorf("opening upload file %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	info, err := file.Stat()
 	if err != nil {

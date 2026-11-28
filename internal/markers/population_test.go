@@ -578,7 +578,7 @@ func TestPopulationSaveDeadline(t *testing.T) {
 	defer cancelNearlyDone()
 	for _, tc := range []struct {
 		name string
-		ctx  context.Context
+		ctx  context.Context //nolint:containedctx // The table row carries the context under test; saveDeadline consumes it directly.
 		want time.Duration
 	}{
 		{"caller waiting", live, time.Minute},

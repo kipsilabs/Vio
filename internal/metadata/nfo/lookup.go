@@ -214,7 +214,7 @@ func (p *parsedNFO) clone() *parsedNFO {
 // the provider by directory modification time, so a flat folder of thousands
 // of movies is listed once per change rather than once per item and phase.
 type sidecarLookup struct {
-	ctx      context.Context
+	ctx      context.Context //nolint:containedctx // A per-request lookup caches sidecar reads under the caller's context.
 	provider *Provider
 	listings map[string]*dirListing // this call's listings, without re-statting
 	stacks   map[stackKey]bool      // this call's isStacked answers

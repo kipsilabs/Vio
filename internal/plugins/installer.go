@@ -846,7 +846,7 @@ func readZipFile(file *zip.File) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open plugin archive entry %q: %w", file.Name, err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {

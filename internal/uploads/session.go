@@ -338,7 +338,7 @@ func (m *Manager) copyChunkBody(ctx context.Context, s *session, offset int64, b
 	if err != nil {
 		return 0, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	writer := io.NewOffsetWriter(file, offset)
 	written, err := io.Copy(writer, io.LimitReader(body, expectedSize))

@@ -40,7 +40,7 @@ func (r *PostgresRepository) InsertReceiving(ctx context.Context, input InsertRe
 	if err != nil {
 		return InsertReceivingResult{}, fmt.Errorf("begin diagnostic report insert: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1::int4, $2::int4)`,
 		diagnosticQuotaLockNamespace, input.UserID); err != nil {
