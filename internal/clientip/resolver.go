@@ -202,6 +202,8 @@ func (r *Resolver) ReloadTrustedCIDRs(ctx context.Context, store SettingsStore) 
 const (
 	forwardedProtoWS  = "ws"
 	forwardedProtoWSS = "wss"
+	schemeHTTP        = "http"
+	schemeHTTPS       = "https"
 )
 
 // requestScheme must run before Middleware replaces the transport peer address.
@@ -210,9 +212,9 @@ const (
 // On a WebSocket upgrade, Traefik sends "wss" or "ws" instead of "https" or
 // "http"; those name the same transport security and are accepted there only.
 func (r *Resolver) requestScheme(req *http.Request) string {
-	scheme := "http"
+	scheme := schemeHTTP
 	if req.TLS != nil {
-		scheme = "https"
+		scheme = schemeHTTPS
 	}
 	if !r.peerTrusted(req) {
 		return scheme
@@ -225,11 +227,11 @@ func (r *Resolver) requestScheme(req *http.Request) string {
 		return ""
 	}
 	switch values[0] {
-	case "http", "https":
+	case schemeHTTP, schemeHTTPS:
 		return values[0]
 	case forwardedProtoWS:
 		if isWebSocketUpgrade(req) {
-			return "http"
+			return schemeHTTP
 		}
 	case forwardedProtoWSS:
 		if isWebSocketUpgrade(req) {

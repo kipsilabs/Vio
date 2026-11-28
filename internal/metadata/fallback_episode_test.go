@@ -516,14 +516,14 @@ func newFakeEpisodeLinkerFileRepo() *fakeEpisodeLinkerFileRepo {
 
 func (r *fakeEpisodeLinkerFileRepo) addFile(file *models.MediaFile) {
 	r.mu.Lock()
-	defer r.fakeFileRepo.mu.Unlock()
+	defer r.mu.Unlock()
 	cp := *file
 	r.files[file.ID] = &cp
 }
 
 func (r *fakeEpisodeLinkerFileRepo) UpdateEpisodeLink(_ context.Context, fileID int, _ string, episodeID string, seasonNum, episodeNum int) error {
-	r.fakeFileRepo.mu.Lock()
-	defer r.fakeFileRepo.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.episodeLinks[fileID] = episodeID
 	if file, ok := r.files[fileID]; ok {
 		file.EpisodeID = episodeID
@@ -534,8 +534,8 @@ func (r *fakeEpisodeLinkerFileRepo) UpdateEpisodeLink(_ context.Context, fileID 
 }
 
 func (r *fakeEpisodeLinkerFileRepo) ListBySeriesUnlinked(_ context.Context, seriesContentID string) ([]*models.MediaFile, error) {
-	r.fakeFileRepo.mu.Lock()
-	defer r.fakeFileRepo.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var result []*models.MediaFile
 	for _, file := range r.files {
 		cid := r.contentIDs[file.ID]

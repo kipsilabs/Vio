@@ -319,7 +319,7 @@ func buildTestArchiveWithPostTarPayload(t *testing.T, entries []testArchiveEntry
 			Size:     int64(len(entry.body)),
 			Typeflag: typeflag,
 		}
-		if typeflag != tar.TypeReg && typeflag != tar.TypeRegA {
+		if typeflag != tar.TypeReg && typeflag != tar.TypeRegA { //nolint:staticcheck // tars from older tools use TypeRegA
 			hdr.Size = 0
 		}
 		if err := tw.WriteHeader(hdr); err != nil {

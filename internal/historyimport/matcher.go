@@ -120,9 +120,9 @@ func (m *Matcher) matchEpisode(ctx context.Context, record Record) (*Match, stri
 		value  string
 		label  string
 	}{
-		{column: "tvdb_id", value: record.TVDBID, label: "tvdb_id"},
-		{column: "tmdb_id", value: record.TMDBID, label: "tmdb_id"},
-		{column: "imdb_id", value: record.IMDbID, label: "imdb_id"},
+		{column: columnTVDB, value: record.TVDBID, label: columnTVDB},
+		{column: columnTMDB, value: record.TMDBID, label: columnTMDB},
+		{column: columnIMDb, value: record.IMDbID, label: columnIMDb},
 	} {
 		if candidate.value == "" {
 			continue
@@ -155,9 +155,9 @@ func (m *Matcher) matchEpisode(ctx context.Context, record Record) (*Match, stri
 		value  string
 		label  string
 	}{
-		{column: "tvdb_id", value: record.SeriesTVDBID, label: "series tvdb_id"},
-		{column: "tmdb_id", value: record.SeriesTMDBID, label: "series tmdb_id"},
-		{column: "imdb_id", value: record.SeriesIMDbID, label: "series imdb_id"},
+		{column: columnTVDB, value: record.SeriesTVDBID, label: "series tvdb_id"},
+		{column: columnTMDB, value: record.SeriesTMDBID, label: "series tmdb_id"},
+		{column: columnIMDb, value: record.SeriesIMDbID, label: "series imdb_id"},
 	} {
 		if candidate.value == "" {
 			continue
@@ -223,9 +223,9 @@ func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID s
 		value  string
 		label  string
 	}{
-		{column: "tmdb_id", value: tmdbID, label: "tmdb_id"},
-		{column: "imdb_id", value: imdbID, label: "imdb_id"},
-		{column: "tvdb_id", value: tvdbID, label: "tvdb_id"},
+		{column: columnTMDB, value: tmdbID, label: columnTMDB},
+		{column: columnIMDb, value: imdbID, label: columnIMDb},
+		{column: columnTVDB, value: tvdbID, label: columnTVDB},
 	}
 	if kind == KindSeries {
 		candidates = []struct {
@@ -233,9 +233,9 @@ func (m *Matcher) matchMedia(ctx context.Context, kind, tmdbID, imdbID, tvdbID s
 			value  string
 			label  string
 		}{
-			{column: "tvdb_id", value: tvdbID, label: "tvdb_id"},
-			{column: "tmdb_id", value: tmdbID, label: "tmdb_id"},
-			{column: "imdb_id", value: imdbID, label: "imdb_id"},
+			{column: columnTVDB, value: tvdbID, label: columnTVDB},
+			{column: columnTMDB, value: tmdbID, label: columnTMDB},
+			{column: columnIMDb, value: imdbID, label: columnIMDb},
 		}
 		if preferTMDB {
 			candidates[0], candidates[1] = candidates[1], candidates[0]
