@@ -879,7 +879,7 @@ func (s *MetadataService) itemLibrariesAgreeOnLanguage(ctx context.Context, cont
 func parseProcessFolderID(raw string) int {
 	folderID := 0
 	if raw != "" {
-		fmt.Sscanf(raw, "%d", &folderID)
+		_, _ = fmt.Sscanf(raw, "%d", &folderID)
 	}
 	return folderID
 }
@@ -3364,7 +3364,7 @@ func (s *MetadataService) mergeAndPersist(
 	// this point; it uses the matched-only upsert as a secondary confirmation.
 	if req.Mode == ModeInitialMatch && req.FolderID != "" {
 		folderID := 0
-		fmt.Sscanf(req.FolderID, "%d", &folderID)
+		_, _ = fmt.Sscanf(req.FolderID, "%d", &folderID)
 		if err := s.upsertLibraryMembershipIfMatched(ctx, contentID, folderID); err != nil {
 			s.logLibraryMembershipError("ensuring matched library membership", contentID, folderID, err)
 		}
@@ -4948,7 +4948,7 @@ func (s *MetadataService) resolveSeriesRefreshProviderIDs(ctx context.Context, s
 	}
 	suppressProviderIDValues(accumulatedIDs, recordedStaleIDs)
 
-	itemChain, err := s.resolveChainCached(ctx, folderID, "series")
+	itemChain, err := s.resolveChainCached(ctx, folderID, series.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve series provider chain: %w", err)
 	}
@@ -10630,13 +10630,16 @@ func ImageTypeToString(t ImageType) string {
 // ImageTypeFromString converts a string to an ImageType. It parses only the
 // types the admin image picker can apply; anything else stays a poster, as it
 // always has for that endpoint.
+// ImageTypeFromString converts a string to an ImageType. "titlecard" is the
+// client-facing name for an episode's still, so it maps to ImageStill: the
+// artwork target validation then accepts it only on episode scope.
 func ImageTypeFromString(s string) ImageType {
 	switch s {
 	case "backdrop":
 		return ImageBackdrop
 	case "logo":
 		return ImageLogo
-	case "still":
+	case "still", "titlecard":
 		return ImageStill
 	case "profile":
 		return ImageProfile
