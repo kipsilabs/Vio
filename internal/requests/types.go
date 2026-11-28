@@ -37,9 +37,11 @@ const StatusFailed Status = "failed" // target-only status; requests use outcome
 type Outcome string
 
 const (
-	OutcomeActive    Outcome = "active"
-	OutcomeDeclined  Outcome = "declined"
-	OutcomeCancelled Outcome = "canceled"
+	OutcomeActive   Outcome = "active"
+	OutcomeDeclined Outcome = "declined"
+	// The stored and wire value is the contract's and the database check
+	// constraint's spelling; a rename needs a migration and a client release.
+	OutcomeCancelled Outcome = "cancelled" //nolint:misspell // persisted contract value.
 	OutcomeFailed    Outcome = "failed"
 )
 

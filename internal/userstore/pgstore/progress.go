@@ -145,7 +145,10 @@ func (s *PostgresUserStore) CommitPlaybackStop(ctx context.Context, stop usersto
 		return nil, false, err
 	}
 	position, completed, _ := userstore.ResolveProgressState(stop.PositionSeconds, entry.DurationSeconds, stop.Thresholds)
-	if err := s.updateProgress(ctx, tx.Exec, entry.ProfileID, entry.MediaItemID, position, entry.DurationSeconds, completed); err != nil {
+	if err := lockWatchStateSeries(ctx, tx, []string{entry.MediaItemID}); err != nil {
+		return nil, false, err
+	}
+	if err := s.writeProgress(ctx, tx, entry.ProfileID, entry.MediaItemID, position, entry.DurationSeconds, completed); err != nil {
 		return nil, false, err
 	}
 	if err := s.updateProgressHints(ctx, tx.Exec, entry.ProfileID, entry.MediaItemID, stop.Hints); err != nil {
@@ -162,7 +165,6 @@ func (s *PostgresUserStore) CommitPlaybackStop(ctx context.Context, stop usersto
 }
 
 func (s *PostgresUserStore) updateProgress(ctx context.Context, exec func(context.Context, string, ...any) (pgconn.CommandTag, error), profileID, mediaItemID string, position, duration float64, completed bool) error {
-	now := time.Now().UTC()
 	// `completed` is a one-way watched latch; position resets to 0 on
 	// completion so `position_seconds > 0` means "has a resume point".
 	// Position itself is last-write-wins: a deliberate backward seek is a
@@ -171,11 +173,20 @@ func (s *PostgresUserStore) updateProgress(ctx context.Context, exec func(contex
 	// completed row still re-enters Continue Watching (stored position is 0,
 	// any heartbeat replaces it) while the watched flag survives.
 	return s.withWatchStateSeries(ctx, []string{mediaItemID}, func(tx pgx.Tx) error {
-		targetID, err := canonicalWatchStateID(ctx, tx, mediaItemID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `
+		return s.writeProgress(ctx, tx, profileID, mediaItemID, position, duration, completed)
+	})
+}
+
+// writeProgress writes one profile's progress row inside tx. The caller holds
+// the watch-state series lock, so an episode alias cannot move the target
+// between canonicalization and the write.
+func (s *PostgresUserStore) writeProgress(ctx context.Context, tx pgx.Tx, profileID, mediaItemID string, position, duration float64, completed bool) error {
+	now := time.Now().UTC()
+	targetID, err := canonicalWatchStateID(ctx, tx, mediaItemID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
 		WITH visible AS (
 			SELECT
 				CASE
@@ -200,13 +211,12 @@ func (s *PostgresUserStore) updateProgress(ctx context.Context, exec func(contex
 				THEN TRUE ELSE user_watch_progress.completed END,
 			updated_at = excluded.updated_at,
 			event_at = excluded.updated_at`,
-			s.userID, profileID, targetID, position, duration, completed, now,
-		)
-		if err != nil {
-			return fmt.Errorf("updating progress: %w", err)
-		}
-		return nil
-	})
+		s.userID, profileID, targetID, position, duration, completed, now,
+	)
+	if err != nil {
+		return fmt.Errorf("updating progress: %w", err)
+	}
+	return nil
 }
 
 // SetProgress bypasses the forward-only guard after the min-resume threshold.
