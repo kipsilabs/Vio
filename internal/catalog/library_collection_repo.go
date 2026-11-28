@@ -417,9 +417,15 @@ func CreateLibraryCollectionInTx(ctx context.Context, tx pgx.Tx, input CreateLib
 		)
 		RETURNING id`
 
-	id, err := idgen.NextID()
-	if err != nil {
-		return "", fmt.Errorf("generate id: %w", err)
+	// A restore plan names the collection ID it will lock and report on;
+	// an editor's create leaves it empty and gets a fresh one.
+	id := strings.TrimSpace(input.ID)
+	if id == "" {
+		var err error
+		id, err = idgen.NextID()
+		if err != nil {
+			return "", fmt.Errorf("generate id: %w", err)
+		}
 	}
 	legacyLibraryID := input.LibraryID
 	if legacyLibraryID <= 0 && len(input.LibraryIDs) > 0 {
