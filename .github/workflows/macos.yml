@@ -53,13 +53,14 @@ jobs:
         working-directory: web
         run: pnpm run build
 
-      # Build with the toolchain go.mod requires, the same one CI uses.
-      # setup-go exports GOTOOLCHAIN=local, so a version range pinned here
-      # could not even build a module whose `go` directive it lags.
+      # The archive ships the standard library, so build it on the latest 1.27
+      # patch as CI and the Docker image do, not the go.mod minimum.
+      # check-latest keeps an older cached 1.27 on the runner from winning.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: '>=1.27 <1.28'
+          check-latest: true
           cache: true
           cache-dependency-path: go.sum
 
@@ -87,13 +88,13 @@ jobs:
           BUILDINFO_PKG: github.com/Silo-Server/silo-server/internal/buildinfo
         run: |
           built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          archive="vio-darwin-arm64-${GITHUB_SHA::8}.tar.gz"
-          package_dir="dist/vio-darwin-arm64"
+          archive="silo-darwin-arm64-${GITHUB_SHA::8}.tar.gz"
+          package_dir="dist/silo-darwin-arm64"
           mkdir -p "$package_dir"
 
           go build -trimpath \
             -ldflags "-X ${BUILDINFO_PKG}.revisionOverride=${GITHUB_SHA} -X ${BUILDINFO_PKG}.dirtyOverride=false -X ${BUILDINFO_PKG}.builtAtOverride=${built_at}" \
-            -o "$package_dir/vio" ./cmd/silo/
+            -o "$package_dir/silo" ./cmd/silo/
 
           cp LICENSE "$package_dir/LICENSE"
           cp PLATFORM-EXCEPTION.md "$package_dir/PLATFORM-EXCEPTION.md"
@@ -107,9 +108,9 @@ jobs:
         env:
           ARCHIVE: ${{ steps.build.outputs.archive }}
         run: |
-          file dist/vio-darwin-arm64/vio | grep -q 'Mach-O 64-bit executable arm64'
-          dist/vio-darwin-arm64/vio -h >/dev/null
-          grep -aFq "$GITHUB_SHA" dist/vio-darwin-arm64/vio
+          file dist/silo-darwin-arm64/silo | grep -q 'Mach-O 64-bit executable arm64'
+          dist/silo-darwin-arm64/silo -h >/dev/null
+          grep -aFq "$GITHUB_SHA" dist/silo-darwin-arm64/silo
 
           ffmpeg -hide_banner -hwaccels > "$RUNNER_TEMP/ffmpeg-hwaccels.txt" 2>/dev/null
           grep -Fxq 'videotoolbox' "$RUNNER_TEMP/ffmpeg-hwaccels.txt"
@@ -124,7 +125,7 @@ jobs:
       - name: Upload native server
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: vio-darwin-arm64-${{ github.sha }}
+          name: silo-darwin-arm64-${{ github.sha }}
           path: |
             dist/${{ steps.build.outputs.archive }}
             dist/${{ steps.build.outputs.archive }}.sha256

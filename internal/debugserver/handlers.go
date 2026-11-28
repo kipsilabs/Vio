@@ -122,12 +122,12 @@ func (g captureGuard) wrap(name string, next http.Handler) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("X-Vio-Go-Version", runtime.Version())
-		w.Header().Set("X-Vio-Revision", g.revision)
-		w.Header().Set("X-Vio-Instance", g.instance)
-		w.Header().Set("X-Vio-Block-Rate", strconv.Itoa(g.config.BlockRate))
-		w.Header().Set("X-Vio-Mutex-Fraction", strconv.Itoa(g.config.MutexFraction))
-		w.Header().Set("X-Vio-Memory-Profile-Rate", strconv.Itoa(runtime.MemProfileRate))
+		w.Header().Set("X-Silo-Go-Version", runtime.Version())
+		w.Header().Set("X-Silo-Revision", g.revision)
+		w.Header().Set("X-Silo-Instance", g.instance)
+		w.Header().Set("X-Silo-Block-Rate", strconv.Itoa(g.config.BlockRate))
+		w.Header().Set("X-Silo-Mutex-Fraction", strconv.Itoa(g.config.MutexFraction))
+		w.Header().Set("X-Silo-Memory-Profile-Rate", strconv.Itoa(runtime.MemProfileRate))
 		if name == indexName {
 			next.ServeHTTP(w, r)
 			return
@@ -149,23 +149,23 @@ func (g captureGuard) wrap(name string, next http.Handler) http.Handler {
 			return
 		}
 		started := time.Now()
-		w.Header().Set("X-Vio-Capture-Started", started.UTC().Format(time.RFC3339Nano))
-		w.Header().Set("X-Vio-Capture-Requested-Seconds", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64))
-		w.Header().Add("Trailer", "X-Vio-Capture-Interrupted")
-		w.Header().Add("Trailer", "X-Vio-Capture-Duration-Seconds")
+		w.Header().Set("X-Silo-Capture-Started", started.UTC().Format(time.RFC3339Nano))
+		w.Header().Set("X-Silo-Capture-Requested-Seconds", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64))
+		w.Header().Add("Trailer", "X-Silo-Capture-Interrupted")
+		w.Header().Add("Trailer", "X-Silo-Capture-Duration-Seconds")
 		ctx, cancel := context.WithTimeout(r.Context(), duration+10*time.Second)
 		defer cancel()
 		// Pass the original writer through. Standard timed handlers use its
 		// ResponseController to extend the write deadline by the capture time.
 		next.ServeHTTP(w, r.WithContext(ctx))
-		w.Header().Set("X-Vio-Capture-Interrupted", strconv.FormatBool(ctx.Err() != nil))
-		w.Header().Set("X-Vio-Capture-Duration-Seconds", strconv.FormatFloat(time.Since(started).Seconds(), 'f', 6, 64))
+		w.Header().Set("X-Silo-Capture-Interrupted", strconv.FormatBool(ctx.Err() != nil))
+		w.Header().Set("X-Silo-Capture-Duration-Seconds", strconv.FormatFloat(time.Since(started).Seconds(), 'f', 6, 64))
 	})
 }
 
 func (g captureGuard) index(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "<!doctype html><html><head><title>Vio process profiles</title></head><body><h1>Vio process profiles</h1><p>Instance: %s. Go: %s. Revision: %s.</p><ul>", html.EscapeString(g.instance), html.EscapeString(runtime.Version()), html.EscapeString(g.revision))
+	_, _ = fmt.Fprintf(w, "<!doctype html><html><head><title>Silo process profiles</title></head><body><h1>Silo process profiles</h1><p>Instance: %s. Go: %s. Revision: %s.</p><ul>", html.EscapeString(g.instance), html.EscapeString(runtime.Version()), html.EscapeString(g.revision))
 	for _, name := range []string{profileName, traceName, heapName, allocsName, goroutineName, threadcreateName, blockName, mutexName} {
 		if (name == blockName && g.config.BlockRate == 0) || (name == mutexName && g.config.MutexFraction == 0) {
 			_, _ = fmt.Fprintf(w, "<li>%s: sampling disabled</li>", name)

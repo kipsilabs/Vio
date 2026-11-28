@@ -29,6 +29,7 @@ func TestExternalIDLookupSkipsItemsWithAnotherTMDBIDDB(t *testing.T) {
 	var contentIDs []string
 	t.Cleanup(func() {
 		batchEquivExec(t, pool, `DELETE FROM media_items WHERE content_id = ANY($1)`, contentIDs)
+		batchEquivExec(t, pool, `DELETE FROM media_files WHERE media_folder_id = $1`, lib)
 		batchEquivExec(t, pool, `DELETE FROM media_folders WHERE id = $1`, lib)
 	})
 
@@ -53,6 +54,18 @@ func TestExternalIDLookupSkipsItemsWithAnotherTMDBIDDB(t *testing.T) {
 			VALUES ($1, $2, $3, $4, $5, $6)`,
 			contentID, it.itemType, it.contentID, it.tmdb, it.tvdb, it.imdb)
 		batchEquivExec(t, pool, `INSERT INTO media_item_libraries (content_id, media_folder_id) VALUES ($1, $2)`, contentID, lib)
+		// Request presence only counts a title the viewer can actually play,
+		// so every fixture item has a present file in its library.
+		if it.itemType == "series" {
+			episodeID := contentID + "-e1"
+			batchEquivExec(t, pool, `INSERT INTO episodes (content_id, series_id, season_number, episode_number, title)
+				VALUES ($1, $2, 1, 1, $1)`, episodeID, contentID)
+			batchEquivExec(t, pool, `INSERT INTO media_files (content_id, episode_id, media_folder_id, file_path, file_size)
+				VALUES ($1, $2, $3, $4, 1)`, contentID, episodeID, lib, "/"+episodeID)
+		} else {
+			batchEquivExec(t, pool, `INSERT INTO media_files (content_id, media_folder_id, file_path, file_size)
+				VALUES ($1, $2, $3, 1)`, contentID, lib, "/"+contentID)
+		}
 		if it.mipProvider != "" {
 			batchEquivExec(t, pool, `
 				INSERT INTO media_item_provider_ids (content_id, item_type, provider, provider_id)

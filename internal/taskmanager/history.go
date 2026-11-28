@@ -12,7 +12,7 @@ type ExecutionResult struct {
 	TaskKey      string          `json:"task_key"`
 	StartedAt    time.Time       `json:"started_at"`
 	CompletedAt  time.Time       `json:"completed_at"`
-	Status       string          `json:"status"` // "completed", "failed", "canceled"
+	Status       string          `json:"status"` // "completed", "failed", or the store's terminal status
 	ErrorMessage string          `json:"error_message,omitempty"`
 	ResultData   json.RawMessage `json:"result_data,omitempty"`
 	DurationMs   int64           `json:"duration_ms"`

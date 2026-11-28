@@ -1491,7 +1491,7 @@ func (fakeOAuth) ServeStart(w http.ResponseWriter, r *http.Request, req auth.OAu
 		return
 	}
 	redirectURI := "https://silo.example.test" + req.Prefix + "/auth/oauth/3/callback"
-	http.SetCookie(w, &http.Cookie{Name: "vio_oauth_fixture", Value: "binder", Path: req.Prefix + "/auth/oauth/3/callback", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	http.SetCookie(w, &http.Cookie{Name: "silo_oauth_fixture", Value: "binder", Path: req.Prefix + "/auth/oauth/3/callback", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.Redirect(w, r, "https://sso.example.test/authorize?redirect_uri="+url.QueryEscape(redirectURI)+"&next="+url.QueryEscape(req.Next), http.StatusFound)
 }
 
@@ -1573,7 +1573,7 @@ func (fakeOAuth) StartLink(_ context.Context, userID int, prefix, ticket, next s
 	callback := "https://silo.example.test" + prefix + "/auth/oauth/3/callback"
 	return auth.OAuthStartResult{
 		AuthorizeURL: "https://sso.example.test/authorize?prompt=login&redirect_uri=" + url.QueryEscape(callback) + "&next=" + url.QueryEscape(next),
-		Cookie:       &http.Cookie{Name: "vio_oauth_fixture", Value: "binder", Path: prefix + "/auth/oauth/3/callback", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600},
+		Cookie:       &http.Cookie{Name: "silo_oauth_fixture", Value: "binder", Path: prefix + "/auth/oauth/3/callback", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600},
 	}, nil
 }
 

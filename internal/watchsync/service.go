@@ -813,11 +813,7 @@ func (s *Service) syncConnectionWithRun(ctx context.Context, conn Connection, ru
 
 func (s *Service) tryLock(connectionID string) (func(), bool) {
 	value, _ := s.locks.LoadOrStore(connectionID, &sync.Mutex{})
-	mu, ok := value.(*sync.Mutex)
-	if !ok {
-		s.locks.Delete(connectionID)
-		return nil, false
-	}
+	mu := value.(*sync.Mutex) //nolint:errcheck,forcetypeassert // locks stores only *sync.Mutex
 	if !mu.TryLock() {
 		return nil, false
 	}
@@ -2354,7 +2350,6 @@ func intValue(value *int) int {
 	return *value
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func parseInt(value string) int {
 	parsed, _ := strconv.Atoi(value)
 	return parsed
@@ -2610,11 +2605,7 @@ func scrobbleDispatchKey(scrobbler Scrobbler, conn Connection, event ScrobbleEve
 
 func (s *Service) enqueueOrderedScrobble(key string, dispatch func()) {
 	value, _ := s.scrobbleQueues.LoadOrStore(key, &scrobbleQueue{})
-	queue, ok := value.(*scrobbleQueue)
-	if !ok {
-		queue = &scrobbleQueue{}
-		s.scrobbleQueues.Store(key, queue)
-	}
+	queue := value.(*scrobbleQueue) //nolint:errcheck,forcetypeassert // scrobbleQueues stores only *scrobbleQueue
 
 	queue.mu.Lock()
 	previous := queue.tail

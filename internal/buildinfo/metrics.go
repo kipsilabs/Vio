@@ -14,7 +14,7 @@ func init() {
 	if revision == "" {
 		revision = unavailableDisplay
 	}
-	metric := prometheus.NewGauge(prometheus.GaugeOpts{Name: "vio_build_info", Help: "Running binary identity; revision is unavailable when build metadata was stripped.", ConstLabels: prometheus.Labels{"revision": revision, "dirty": strconv.FormatBool(info.Dirty), "go_version": runtime.Version()}})
+	metric := prometheus.NewGauge(prometheus.GaugeOpts{Name: "silo_build_info", Help: "Running binary identity; revision is unavailable when build metadata was stripped.", ConstLabels: prometheus.Labels{"revision": revision, "dirty": strconv.FormatBool(info.Dirty), "go_version": runtime.Version()}})
 	metric.Set(1)
 	prometheus.MustRegister(metric)
 }

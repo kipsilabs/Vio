@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	swapStamp    = "20261031t040000z"
+	swapStamp    = "20261031t040000z_100"
 	liveDB       = "silo"
 	restoredDB   = "silo_restore_" + swapStamp
 	beforeDB     = "silo_before_restore_" + swapStamp
@@ -54,7 +54,11 @@ type fakeDB struct {
 // anything can record it; lostReply applies a statement and then reports an
 // error, as a dropped connection would.
 type fakeControl struct {
-	t         *testing.T
+	t *testing.T
+	// own answers OwnApplicationName, and liveURLs records the live
+	// database URLs the loader was asked to read.
+	own       string
+	liveURLs  []string
 	dbs       map[string]*fakeDB
 	nextOID   uint32
 	calls     []string
@@ -84,6 +88,10 @@ type fakeControl struct {
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
+	// unreadable are the settings ClearUnreadableSettings clears, cleared
+	// the outbound bundles CarryOutboundSettings clears, and liveOwn the
+	// server-specific settings the live server holds.
+	unreadable, cleared, liveOwn []string
 }
 
 type fakeRestoreLocks struct {
@@ -160,6 +168,7 @@ func (f *fakeControl) OtherConnections(_ context.Context, name string) (int, err
 	}
 	return 0, nil
 }
+func (f *fakeControl) OwnApplicationName() string                    { return f.own }
 func (f *fakeControl) CheckPrivileges(context.Context, string) error { return nil }
 func (f *fakeControl) CheckExtensions(_ context.Context, names []string) error {
 	f.checkedExtensions = names
@@ -247,7 +256,7 @@ type fakeLoader struct {
 func (l fakeLoader) Empty(context.Context, string) (bool, error) { return true, nil }
 func (l fakeLoader) UnbindStorage(context.Context, string) error { return nil }
 func (l fakeLoader) ClearUnreadableSettings(context.Context, string, *secret.Cipher) ([]string, error) {
-	return nil, nil
+	return l.ctl.unreadable, nil
 }
 func (l fakeLoader) DropSubtitles(context.Context, string, func(context.Context, string) (bool, error)) (int, error) {
 	return 0, nil
@@ -267,6 +276,7 @@ func (l fakeLoader) CarryPolicies(context.Context, string, string) ([]string, er
 func (l fakeLoader) CarryPluginReleases(context.Context, string, string) ([]string, error) {
 	return nil, nil
 }
+func (l fakeLoader) AdvanceAccountIDs(context.Context, string, string) error { return nil }
 func (l fakeLoader) DisablePlugins(context.Context, string) ([]string, error) {
 	return nil, nil
 }
@@ -277,14 +287,18 @@ func (l fakeLoader) CarryServerSpecificSettings(context.Context, string, string)
 	return 0, nil
 }
 func (l fakeLoader) CarryOutboundSettings(context.Context, string, string, *secret.Cipher) ([]string, []string, error) {
-	return nil, nil, nil
+	return nil, l.ctl.cleared, nil
+}
+func (l fakeLoader) ServerSpecificSettingKeys(context.Context, string, *secret.Cipher) ([]string, error) {
+	return l.ctl.liveOwn, nil
 }
 func (l fakeLoader) InterruptWork(context.Context, string, string) ([]string, error) { return nil, nil }
 func (l fakeLoader) Superuser(context.Context, string) (bool, error)                 { return l.ctl.superuser, nil }
 func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {
 	return AccountRollback{}, nil
 }
-func (l fakeLoader) ServerID(context.Context, string) (string, error) {
+func (l fakeLoader) ServerID(_ context.Context, liveURL string) (string, error) {
+	l.ctl.liveURLs = append(l.ctl.liveURLs, liveURL)
 	if l.ctl.liveServerID != "" {
 		return l.ctl.liveServerID, nil
 	}
@@ -466,11 +480,7 @@ func newSwapFixtureWith(t *testing.T, entries []tarEntry) *swapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workDir := t.TempDir()
-	if err := os.Chmod(workDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: workDir, cipher: cipher,
+	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher,
 		validate: ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}}
 }
 
@@ -599,6 +609,27 @@ func (f *swapFixture) wantClosedThroughout() {
 	for i := closed; i < reopened; i++ {
 		if len(f.ctl.openAfter[i]) != 0 {
 			f.t.Fatalf("after %q these databases admitted connections: %v", f.ctl.calls[i], f.ctl.openAfter[i])
+		}
+	}
+}
+
+// TestSwapNamesItsOwnConnections: the restore reads the live database over
+// connections of its own just before it counts the other clients, and a
+// closed connection stays listed for a moment. Those connections carry the
+// control's application name so the count can leave them out. It catches a
+// restore refusing a database nothing else is using.
+func TestSwapNamesItsOwnConnections(t *testing.T) {
+	f := newSwapFixture(t)
+	f.ctl.own = "silo-restore-test"
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("restore: %v\n%s", err, f.output.String())
+	}
+	if len(f.ctl.liveURLs) == 0 {
+		t.Fatal("the restore never read the live database")
+	}
+	for _, liveURL := range f.ctl.liveURLs {
+		if !strings.Contains(liveURL, "application_name=silo-restore-test") {
+			t.Fatalf("a live read used %q, without the restore's application name", liveURL)
 		}
 	}
 }
@@ -861,6 +892,33 @@ func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
 	}
 	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
 		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
+}
+
+// TestSwapReportsOnlyWhatTheRestoredServerLacks: a replace gives the
+// restored database the live server's own settings after it clears what the
+// backup's key cannot read and the outbound credentials it cannot carry, so
+// it never tells the operator to enter again what the live server supplies,
+// such as its AI providers. What the live server does not have is still
+// listed, as is a unit it holds no credential of: a push relay waiting to
+// be registered again.
+func TestSwapReportsOnlyWhatTheRestoredServerLacks(t *testing.T) {
+	f := newSwapFixture(t)
+	f.ctl.liveServerID = "another-deployment"
+	f.validate = ValidateOptions{KeyCheck: "another-key", AcceptLostCredentials: true}
+	f.ctl.unreadable = []string{"ai.providers", "notifications.web_push.vapid_keypair", "tmdb.api_key"}
+	f.ctl.cleared = []string{"mail (SMTP)", "AI providers", "the push relay"}
+	f.ctl.liveOwn = []string{"ai.providers", "notifications.push_relay_reregistration_required",
+		"notifications.push_relay_url", "notifications.web_push.vapid_keypair"}
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	// Each report ends with its list.
+	out := f.output.String()
+	for _, want := range []string{"after Silo starts: tmdb.api_key\n", "in place of the backup's: AI providers.\n", "to use them: mail (SMTP), the push relay.\n"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output lacks %q:\n%s", want, out)
+		}
 	}
 }
 

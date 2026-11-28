@@ -74,8 +74,9 @@ A transcode node that declares a job cap (`SILO_NODE_MAX_TRANSCODES`, see
 [transcode nodes](transcode-nodes.md#what-the-node-enforces)) refuses new work
 past it with `503`, `Retry-After: 5` and `X-Silo-Node-Refusal: at_capacity`
 (`nodepool.NodeRefusalHeader`). It counts what health reports as
-`active_jobs`, plus work it has admitted and not yet counted, under one lock,
-so two starts arriving at the cap less one cannot both pass. The routes that
+`active_jobs`, which includes work it has admitted and not yet started (a
+start still waiting for its first segment), under one lock, so two starts
+arriving at the cap less one cannot both pass. The routes that
 count a job refuse: `POST /transcode/start` (plain text, as when draining),
 `POST /downloads/prepare` (plain text), `POST /trickplay/extract` (reason
 `node_busy`) and a progressive remux `GET`. Work that continues a job the node
@@ -359,9 +360,9 @@ for that textual payload rather than claiming application/json on the wire.
 `hw_accel=auto` (a video transcode without tone mapping that resolves to a
 hardware backend), the node tries CPU decode with GPU encode, then software;
 otherwise it keeps the limited software retry for an early VideoToolbox failure.
-Outside `auto`, when the GPU decoder rejects the source (FFmpeg's
-`Hardware is lacking required capabilities`) of a video transcode that decoded
-on the GPU without tone mapping, the node walks the same CPU decode with GPU
+Outside `auto`, when the GPU decoder rejects the source of a video transcode
+that decoded on the GPU without tone mapping (the rejection lines are listed in
+[restart-resilient-playback.md](restart-resilient-playback.md)), the node walks the same CPU decode with GPU
 encode, then software, instead of failing the start.
 `auto_fallback_ready` asks for that wait only when the node's own `hw_accel=auto`
 pipeline is enabled for the start, judged from its live hardware; otherwise the
@@ -372,21 +373,6 @@ tone mapping it sends `RequireReady`, so the node can take the decoder-rejection
 retry above. Each attempt gets its own manifest wait, so callers size the start
 deadline of an `auto`
 video transcode that sets either field to `TranscodeStartReadyMaxDuration` (one
-wait per path); every other start keeps the single-wait deadline. Readiness is
-judged only on a manifest the current FFmpeg process wrote; an earlier
-generation's `stream.m3u8` in a reused directory does not count. For a video
-encode, readiness also requires that the generation decoded video: segments
-prove the muxer wrote bytes, and an audio-only mux from a decoder that produced
-no picture satisfies every file-existence check while never showing a frame.
-Such a generation is reported as a startup failure once a short grace passes,
-so the caller advances to a safer execution path instead of serving a playlist
-no client can play. A process still running at the deadline is closed, never
-duplicated. The response reports `software_video_decode` when the executed
-recipe decodes on the CPU; older nodes omit it, so callers OR it with the
-requested value. Without `RequireReady`, 202 establishes registration, not
-playable bytes or successful encoder completion. Tracking is asynchronous
-monitoring.
-
 wait per path). A `RequireReady` video transcode under an explicit hardware
 backend gets the same deadline, because a decoder rejection can lead to the
 CPU-decode and software attempts. Every other start keeps the single-wait

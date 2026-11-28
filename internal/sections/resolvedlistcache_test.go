@@ -13,7 +13,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/sections/recipes"
 )
 
 func mediaItems(ids ...string) []*models.MediaItem {
@@ -643,127 +642,6 @@ func TestResolvedListCacheScanGraceExpiresAfterFailedRefresh(t *testing.T) {
 	items, _, err := getOrRefresh(t.Context(), key, now.Add(resolvedListInvalidationGrace), staticLoader(mediaItems("fresh"), nil))
 	if err != nil || !slices.Equal(itemIDs(items), []string{"fresh"}) {
 		t.Fatalf("after deadline: %v, %v", itemIDs(items), err)
-	}
-}
-
-func TestInvalidateAllResolvedListCachesForPurgeDropsEveryRail(t *testing.T) {
-	resetResolvedListCacheForTest()
-	defer resetResolvedListCacheForTest()
-	now := time.Now()
-	recent := ResolvedSection{SectionType: SectionRecentlyAdded, ItemLimit: 20}
-	trending := ResolvedSection{SectionType: SectionTrendingOnServer, ItemLimit: 20}
-	recentKey := resolvedListCacheKey(recent, nil, nil, catalog.AccessFilter{})
-	trendingKey := resolvedListCacheKey(trending, nil, nil, catalog.AccessFilter{})
-	resolvedListSet(recentKey, mediaItems("ghost-recent"), 1, now, resolvedListEvictionEpoch.Load())
-	resolvedListSet(trendingKey, mediaItems("ghost-trending"), 1, now, resolvedListEvictionEpoch.Load())
-	InvalidateAllResolvedListCachesForPurge()
-	if _, ok := resolvedListGet(recentKey); ok {
-		t.Fatal("purge invalidation kept recently_added entry")
-	}
-	if _, ok := resolvedListGet(trendingKey); ok {
-		t.Fatal("purge invalidation kept non-recently-added entry")
-	}
-}
-
-func TestPurgeEpochFencesInFlightLoad(t *testing.T) {
-	resetResolvedListCacheForTest()
-	defer resetResolvedListCacheForTest()
-	now := time.Now()
-	sec := ResolvedSection{SectionType: SectionTrendingOnServer, ItemLimit: 20}
-	oldKey := resolvedListCacheKey(sec, nil, nil, catalog.AccessFilter{})
-	resolvedListSet(oldKey, mediaItems("old"), 1, now, resolvedListEvictionEpoch.Load())
-
-	release := make(chan struct{})
-	loaderStarted := make(chan struct{})
-	loaderDone := make(chan struct{})
-	var loadErr error
-	go func() {
-		defer close(loaderDone)
-		// Expired read: falls through to the blocking rebuild, invoking the
-		// loader. The loader blocks until the purge has committed.
-		_, _, loadErr = getOrRefresh(context.Background(), oldKey, now.Add(resolvedListTTL), func(context.Context) ([]*models.MediaItem, int, error) {
-			close(loaderStarted)
-			<-release
-			return mediaItems("late-stale"), 1, nil
-		})
-	}()
-	<-loaderStarted
-
-	InvalidateAllResolvedListCachesForPurge()
-	close(release)
-	<-loaderDone
-	if loadErr != nil {
-		t.Fatalf("in-flight load: %v", loadErr)
-	}
-
-	newKey := resolvedListCacheKey(sec, nil, nil, catalog.AccessFilter{})
-	if newKey == oldKey {
-		t.Fatal("purge epoch did not advance the cache key")
-	}
-	calls := int64(0)
-	items, _, err := getOrRefresh(context.Background(), newKey, now, staticLoader(mediaItems("fresh"), &calls))
-	if err != nil {
-		t.Fatalf("post-purge load: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("post-purge load must be a cold miss, loader calls = %d", calls)
-	}
-	if got := itemIDs(items); !slices.Equal(got, []string{"fresh"}) {
-		t.Fatalf("post-purge load returned %v, want [fresh]", got)
-	}
-	if entry, ok := resolvedListGet(oldKey); !ok || !slices.Equal(itemIDs(entry.items), []string{"late-stale"}) {
-		t.Fatal("in-flight loader should have written under the old epoch key (never read again)")
-	}
-}
-
-func TestEditorialCandidateCacheEpochFencesPurge(t *testing.T) {
-	resetResolvedListCacheForTest()
-	defer resetResolvedListCacheForTest()
-	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
-	f := &Fetcher{Clock: recipes.FixedClock(now)}
-	loader := func(context.Context, string, *int, []int, catalog.AccessFilter) ([]string, error) {
-		return []string{"ghost"}, nil
-	}
-	first, err := f.cachedEditorialCandidates(context.Background(), "actor", nil, nil, catalog.AccessFilter{}, time.Hour, loader)
-	if err != nil || len(first) != 1 || first[0] != "ghost" {
-		t.Fatalf("prime editorial cache: %v %v", first, err)
-	}
-	InvalidateAllResolvedListCachesForPurge()
-	second, err := f.cachedEditorialCandidates(context.Background(), "actor", nil, nil, catalog.AccessFilter{}, time.Hour, func(context.Context, string, *int, []int, catalog.AccessFilter) ([]string, error) {
-		return []string{"fresh"}, nil
-	})
-	if err != nil || len(second) != 1 || second[0] != "fresh" {
-		t.Fatalf("post-purge editorial candidates = %v, %v; want [fresh]", second, err)
-	}
-}
-
-func TestDropSupersededMatchesGenerationSegmentExactly(t *testing.T) {
-	resetResolvedListCacheForTest()
-	defer resetResolvedListCacheForTest()
-	now := time.Now()
-	sec := ResolvedSection{SectionType: SectionRecentlyAdded, ItemLimit: 20}
-	// Build keys for specific generations directly: "purge=0|generation=N|…"
-	suffix := "type=" + string(sec.SectionType) + "|config=none|limit=20|library=7|libraries=<nil>"
-	gen10Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(10) + suffix
-	resolvedListSet(gen10Key, mediaItems("one"), 1, now, resolvedListEvictionEpoch.Load())
-	resolvedListInvalidationMu.Lock()
-	dropSupersededResolvedListEntries(11)
-	resolvedListInvalidationMu.Unlock()
-	gen11Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(11) + suffix
-	if entry, ok := resolvedListGet(gen11Key); !ok || !slices.Equal(itemIDs(entry.items), []string{"one"}) {
-		t.Fatal("generation 10 entry was not carried forward to generation 11")
-	}
-	if _, ok := resolvedListGet(gen10Key); ok {
-		t.Fatal("stale generation 10 key lingered after sweep")
-	}
-	gen1Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(1) + suffix
-	resolvedListSet(gen1Key, mediaItems("two"), 1, now, resolvedListEvictionEpoch.Load())
-	resolvedListInvalidationMu.Lock()
-	dropSupersededResolvedListEntries(2)
-	resolvedListInvalidationMu.Unlock()
-	gen2Key := resolvedListPurgeEpochKeyPrefix(0) + resolvedListGenerationKeyPrefix(2) + suffix
-	if entry, ok := resolvedListGet(gen2Key); !ok || !slices.Equal(itemIDs(entry.items), []string{"two"}) {
-		t.Fatal("generation 1 entry was not carried forward to generation 2 (substring match)")
 	}
 }
 

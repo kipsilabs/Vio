@@ -41,7 +41,10 @@ var loggedTables = []string{"activity_log", "operational_logs", "policy_decision
 	"task_execution_leases",
 	// Provisioning status and placement from the current deployment must not
 	// be replayed by a restored backup.
-	tablePluginProvisionStatus, "plugin_provision_placement"}
+	tablePluginProvisionStatus, "plugin_provision_placement",
+	// Plugin builds for other platforms: a server fetches its own again
+	// from the catalog.
+	"plugin_platform_archives"}
 
 const tableIntroFingerprints = "media_intro_fingerprints"
 
@@ -49,10 +52,11 @@ const tableIntroFingerprints = "media_intro_fingerprints"
 // metadata, accounts and profiles with their data, and configuration.
 var restoredDataTables = strings.Fields(`
 	abs_bookmarks access_groups admin_dashboard_layouts admin_playback_history anime_ids
-	audiobook_series autoscan_settings autoscan_sources client_diagnostic_reports download_artifacts
+	audiobook_series autoscan_settings autoscan_sources client_diagnostic_reports dashboard_metric_daily
+	dashboard_node_egress_daily download_artifacts
 	download_subscriptions downloaded_subtitles downloads ebook_reader_annotations ebook_reader_config
-	ebook_reader_progress ebook_series embedded_subtitle_tracks episode_aliases episode_availability
-	episode_catalog_entries episode_libraries episode_localizations episodes external_subtitle_timings
+	ebook_reader_progress ebook_series embedded_subtitle_tracks episode_availability
+	episode_aliases episode_catalog_entries episode_libraries episode_localizations episodes external_subtitle_timings
 	history_import_user_mappings item_availability item_people item_theme_songs item_videos
 	jellycompat_displayprefs library_collection_items library_collection_libraries
 	library_provider_chains literary_work_items literary_work_match_decisions literary_works
@@ -63,9 +67,9 @@ var restoredDataTables = strings.Fields(`
 	media_item_rating_sources media_item_roots media_item_tmdb_collections media_item_work_ids media_items
 	media_request_events media_request_follows media_request_targets media_requests
 	media_root_overrides movie_availability notification_preferences observed_media_locations
-	overlay_images page_sections people plugin_archives plugin_capabilities plugin_installations
-	plugin_task_bindings podcast_feeds
-	profile_series_interest profile_series_notification_mutes request_group_limits
+	overlay_images page_sections people plugin_archives plugin_capabilities plugin_installations 
+	 plugin_task_bindings podcast_feeds 
+	 profile_series_interest profile_series_notification_mutes request_group_limits
 	request_routes request_routing request_settings request_user_limits scanned_media_groups
 	scanned_media_roots season_localizations seasons server_settings skipped_media_roots
 	stale_media_ids task_schedules task_triggers tmdb_movie_collections user_audio_preferences
@@ -75,8 +79,8 @@ var restoredDataTables = strings.Fields(`
 	user_personal_collection_items user_personal_collection_profiles user_personal_collections
 	user_profile_allowed_libraries user_profile_onboarding profile_title_allowances profile_collection_allowances user_ratings
 	user_series_playback_preferences user_setting_values user_settings user_subtitle_preferences
-	user_watch_history user_watch_progress user_watchlist user_watchlist_titles virtual_indexer_releases
-	watchlist_title_aliases watchlist_titles`)
+	user_watch_history user_watch_progress user_watchlist user_watchlist_titles
+	verified_release_override_history watchlist_title_aliases watchlist_titles`)
 
 // serverStateTables describe the running server rather than its data.
 var serverStateTables = strings.Fields(`
@@ -98,9 +102,9 @@ var serverStateTables = strings.Fields(`
 	notification_content_seed_state notification_deliveries notification_inbox_clocks
 	notification_library_seed_state page_section_revisions page_section_scope_revisions
 	playback_connections playback_route_events playback_session_lifecycle playback_sessions_sync
-	playback_shuffle_items playback_shuffles playback_stop_commits playback_v3_attempts playback_v3_replans release_metadata_queue
+	playback_shuffle_items playback_shuffles playback_stop_commits playback_v3_attempts playback_v3_replans
 	plugin_event_deliveries  policy_generation progress_bootstrap_items
-	progress_bootstrap_snapshots push_delivery_attempts recommendation_cache release_events
+	progress_bootstrap_snapshots push_delivery_attempts recommendation_cache release_events release_metadata_queue
 	request_discover_layout request_discover_list_snapshots scan_runs seasonal_list_snapshots
 	scanner_no_video_files series_match_queue storage_transition_checkpoints storage_transition_cursors
 	stream_node_pool_generation  subtitle_ai_jobs subtitle_sync_jobs task_executions task_firing_claims
@@ -108,7 +112,7 @@ var serverStateTables = strings.Fields(`
 	user_collection_revisions user_last_activity user_personal_collection_poster_variants
 	user_personal_collection_smart_collages user_progress_sync_state user_setting_migration_rejects
 	user_setting_mutations user_taste_clusters user_taste_profiles userdb_import_receipts
-	verified_release_override_history virtual_adoption_refusals virtual_media_file_source_claims virtual_media_source_claims
+	virtual_adoption_refusals virtual_indexer_releases virtual_media_file_source_claims virtual_media_source_claims
 	watch_provider_dropped_items watch_provider_history_exports watch_provider_list_items watch_provider_pending_watches
 	watch_provider_rating_items watch_provider_scrobble_sessions watch_provider_sync_runs
 	watch_together_room_creation_receipts watch_together_suggestion_receipts watchlist_title_promotions

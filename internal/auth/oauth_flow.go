@@ -30,13 +30,13 @@ const PKCEMethodS256 = "S256"
 // oauthBinderCookiePrefix names the browser-binding cookies. Each flow has
 // its own cookie, keyed by its state, so two sign-ins started in two tabs
 // do not overwrite each other's binding.
-const oauthBinderCookiePrefix = "vio_oauth_"
+const oauthBinderCookiePrefix = "silo_oauth_"
 
 // OAuthCompletionCookieName names the cookie that binds a web completion
 // code to the browser the callback answered. The callback sets it on the
 // complete paths of both API versions; a later web sign-in finishing in the
 // same browser replaces it.
-const OAuthCompletionCookieName = "vio_oauth_complete"
+const OAuthCompletionCookieName = "silo_oauth_complete"
 
 // oauthCompletionCookieMaxAge is the completion cookie's lifetime: the
 // code's plus a minute of clock skew.

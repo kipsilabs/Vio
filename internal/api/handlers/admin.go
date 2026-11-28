@@ -2665,16 +2665,22 @@ func shouldPersistAdminSetting(stored map[string]string, key, normalized string,
 // also take.
 func (h *AdminHandler) checkLocalLoginSetting(ctx context.Context, tx pgx.Tx, before, after map[string]string) error {
 	key := config.AuthLocalPasswordLoginSettingKey
-	if before[key] == after[key] {
+	if before[key] == after[key] && before[config.ServerPublicURLSettingKey] == after[config.ServerPublicURLSettingKey] {
 		return nil
 	}
+	toLocalLogin := func(settings map[string]string) auth.LocalLoginSettings {
+		return auth.LocalLoginSettings{
+			LocalPasswordLogin: settings[key],
+			PublicURL:          settings[config.ServerPublicURLSettingKey],
+		}
+	}
 	if tx != nil {
-		return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, tx, before[key], after[key]))
+		return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, tx, toLocalLogin(before), toLocalLogin(after)))
 	}
 	if h.pool == nil {
 		return ErrAdminSettingsUnavailable
 	}
-	return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, h.pool, before[key], after[key]))
+	return breakGlassError(auth.CheckLocalLoginSettingChange(ctx, h.pool, toLocalLogin(before), toLocalLogin(after)))
 }
 
 // errBackupKeyNotConfirmed refuses switching backups to S3 before the admin

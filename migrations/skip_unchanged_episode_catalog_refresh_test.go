@@ -10,7 +10,7 @@ import (
 // sees work done inside triggers.
 func TestSkipUnchangedEpisodeCatalogRefreshMigrationPostgres(t *testing.T) {
 	tx, schema := adminMigrationFixture(t)
-	for _, table := range []string{"media_items", "episodes", "episode_libraries", "media_files", "episode_catalog_entries"} {
+	for _, table := range []string{"media_items", "episodes", "episode_libraries", "media_files", "episode_catalog_entries", "episode_aliases"} {
 		migrationExec(t, tx, "CREATE TABLE "+schema+"."+table+" (LIKE public."+table+" INCLUDING ALL)")
 	}
 	migrationExec(t, tx, "CREATE FUNCTION "+schema+".normalize_search_text(text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN public.normalize_search_text($1); END'")

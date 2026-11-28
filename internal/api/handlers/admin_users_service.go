@@ -342,6 +342,9 @@ func breakGlassError(err error) error {
 	if errors.Is(err, auth.ErrBreakGlassRequired) {
 		return apiError(http.StatusConflict, "break_glass_required", "Local password sign-in is off, and this is the last break-glass admin that can still sign in with a password")
 	}
+	if errors.Is(err, auth.ErrSignInProviderRequired) {
+		return apiError(http.StatusConflict, "sign_in_provider_required", "Local password sign-in cannot be turned off while no sign-in provider can serve everyone")
+	}
 	return err
 }
 

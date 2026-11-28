@@ -8,13 +8,13 @@
   ],
   "heuristic_fields": [
     "request_kind: inferred from decode/parse calls in the handler body, matched by callee name and by the substring \"body\" in the decoded argument",
-    "response_media_kind: inferred from Content-Type string literals and from writer-call names (json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile, ServeSegmentLease)",
+    "response_media_kind: inferred from Content-Type string literals and from writer-call names (json.NewEncoder, writeJSON, respondJSON, writeError, ServeContent, ServeFile)",
     "upgrades_websocket: inferred from an Upgrade/Accept call whose callee names a websocket package or contains the substring \"grade\""
   ],
   "excluded_listeners": [
     "cmd/silo/abs_listener.go#newAudiobookshelfListener: Audiobookshelf-protocol compatibility listener; an external wire contract, out of scope for the native v2 migration",
     "internal/jellycompat/router.go#NewRouter: Jellyfin-protocol compatibility listener; an external wire contract, out of scope for the native v2 migration",
-    "internal/remotestream/relay.go#Relay.start: Streaming relay mux; internal media relay, not part of the native API surface"
+    "internal/remotestream/relay.go#Relay.start: Fork virtual-library relay listener: it streams pre-resolved virtual sources to clients and registers no native route surface"
   ],
   "listeners": [
     {
@@ -7016,7 +7016,7 @@
       "conditions": [],
       "conditional": false,
       "request_kind": "none",
-      "response_media_kind": "binary",
+      "response_media_kind": "unknown",
       "delegates_to": "",
       "streams": true,
       "upgrades_websocket": false,

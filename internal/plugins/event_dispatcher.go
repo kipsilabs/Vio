@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
@@ -276,6 +277,17 @@ func (d *EventDispatcher) ObservePublish(channel string, event cache.Event) {
 		return
 	}
 	d.offer(busEvent(event))
+}
+
+// busEvent is a bus event in the dispatcher's produced shape.
+func busEvent(event cache.Event) producedEvent {
+	return producedEvent{
+		id:   ulid.Make().String(),
+		name: event.Type,
+		payload: func() (*structpb.Struct, error) {
+			return decodeRawJSON(json.RawMessage(event.Payload)), nil
+		},
+	}
 }
 
 // offer queues an event without waiting, and logs it when the intake is full.
@@ -804,15 +816,4 @@ func (f eventConsumerResolverFunc) EventConsumerClient(
 	capabilityID string,
 ) (eventConsumerClient, error) {
 	return f(ctx, installationID, capabilityID)
-}
-
-// busEvent turns a bus event into the dispatcher's intake shape.
-func busEvent(event cache.Event) producedEvent {
-	return producedEvent{
-		id:   ulid.Make().String(),
-		name: event.Type,
-		payload: func() (*structpb.Struct, error) {
-			return decodeRawJSON(json.RawMessage(event.Payload)), nil
-		},
-	}
 }

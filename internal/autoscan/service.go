@@ -447,7 +447,7 @@ func (s *Service) consumeSourceChanges(ctx context.Context, src Source, changes 
 	// Webhook deliveries have no marker: a transient resolve fault still
 	// finishes the event as error (the sender retries the delivery; a
 	// duplicate is at worst suppressed), and the unresolved case is the same
-	// benign "paths outside Vio's libraries" signal.
+	// benign "paths outside Silo's libraries" signal.
 	//
 	// NOTE: len(targets)==0 alone is NOT misconfiguration — paths can resolve
 	// yet be fully suppressed. Gate on resolvedAny, not targets.
@@ -478,7 +478,7 @@ func (s *Service) consumeSourceChanges(ctx context.Context, src Source, changes 
 	markerAfter := opts.NextMarker
 	if len(changes) > 0 && !resolvedAny {
 		status = EventStatusUnresolved
-		unresolvedMsg = fmt.Sprintf("returned %d path(s) but none matched a Vio library folder", len(changes))
+		unresolvedMsg = fmt.Sprintf("returned %d path(s) but none matched a Silo library folder", len(changes))
 		statusMsg = unresolvedMsg
 		if opts.AdvanceMarker {
 			statusMsg += " — advanced past them"

@@ -26,11 +26,9 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	// StatusCancelled is the durable status value. It matches the
-	// admin_jobs_status_check constraint (migration 178) and the literals the
-	// cancel-on-completion paths write in Complete and Fail; a different
-	// spelling would violate the constraint and lose the cancellation.
-	StatusCancelled = "cancelled" //nolint:misspell // Persisted DB enum value (migration 178).
+	// The stored status and the API contract use this spelling; renaming it
+	// needs a migration and a client release.
+	StatusCancelled = "cancelled" //nolint:misspell // persisted status value.
 )
 
 var (
@@ -42,7 +40,7 @@ var (
 
 // cancellableJobTypes are the job types RequestCancellation accepts. Every v2
 // job resource that reports such a job as cancelable accepts its cancellation.
-var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeVirtualCandidatesRefresh, JobTypeVirtualIdentityBackfill, JobTypeImageCacheCleanup, JobTypeBackupRestore}
+var cancellableJobTypes = []string{JobTypeLibraryRefresh, JobTypeStorageTransition, JobTypeImageCacheCleanup, JobTypeBackupRestore}
 
 // IsCancellableJobType reports whether jobs of this type accept cancellation
 // while queued or running.
@@ -256,64 +254,6 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*models.AdminJob, 
 	))
 }
 
-// CreateVirtualCandidatesRefresh persists one Refresh List job for a title.
-// A unique index (job_type, request_payload->>'content_id') enforces one active
-// job per title; a duplicate returns ActiveJobConflictError carrying the
-// already-active job so the caller can answer it like a coalesced command.
-func (r *Repository) CreateVirtualCandidatesRefresh(ctx context.Context, createdByUserID int, req VirtualCandidatesRefreshRequest, message string) (*models.AdminJob, error) {
-	payload, err := marshalPayload(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling virtual candidates refresh payload: %w", err)
-	}
-
-	id, err := idgen.NextID()
-	if err != nil {
-		return nil, fmt.Errorf("generate job id: %w", err)
-	}
-	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
-		INSERT INTO admin_jobs (
-			id, job_type, status, created_by_user_id, request_payload, message
-		) VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING `+adminJobColumns,
-		id,
-		JobTypeVirtualCandidatesRefresh,
-		StatusQueued,
-		createdByUserID,
-		payload,
-		message,
-	))
-	if err == nil {
-		return job, nil
-	}
-
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		activeJob, lookupErr := r.GetActiveVirtualRefreshByContentID(ctx, req.ContentID)
-		if lookupErr != nil && !errors.Is(lookupErr, ErrJobNotFound) {
-			return nil, lookupErr
-		}
-		return nil, &ActiveJobConflictError{Job: activeJob}
-	}
-
-	return nil, fmt.Errorf("creating virtual candidates refresh job: %w", err)
-}
-
-func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, contentID string) (*models.AdminJob, error) {
-	return scanAdminJob(r.pool.QueryRow(ctx, `
-		SELECT `+adminJobColumns+`
-		FROM admin_jobs
-		WHERE job_type = $1
-		  AND status IN ($2, $3)
-		  AND request_payload->>'content_id' = $4
-		ORDER BY requested_at ASC
-		LIMIT 1`,
-		JobTypeVirtualCandidatesRefresh,
-		StatusQueued,
-		StatusRunning,
-		contentID,
-	))
-}
-
 func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*models.AdminJob, error) {
 	return scanAdminJob(r.pool.QueryRow(ctx, `
 		SELECT `+adminJobColumns+`
@@ -323,45 +263,6 @@ func (r *Repository) GetActiveByType(ctx context.Context, jobType string) (*mode
 		LIMIT 1`,
 		jobType, StatusQueued, StatusRunning,
 	))
-}
-
-// LatestJobRequestedAt reports when the newest job of the type was requested,
-// whatever its status. It is the bulk pass's cooldown clock: the operator sees
-// the same timestamp in the job list.
-func (r *Repository) LatestJobRequestedAt(ctx context.Context, jobType string) (time.Time, bool, error) {
-	var requestedAt time.Time
-	err := r.pool.QueryRow(ctx, `
-		SELECT requested_at FROM admin_jobs
-		WHERE job_type = $1
-		ORDER BY requested_at DESC, id DESC
-		LIMIT 1`,
-		jobType,
-	).Scan(&requestedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, nil
-	}
-	if err != nil {
-		return time.Time{}, false, fmt.Errorf("latest admin job of type: %w", err)
-	}
-	return requestedAt, true, nil
-}
-
-// HasFinishedJobOfType reports whether a job of this kind has reached a
-// terminal state the operator did not ask to retry: completed, or canceled.
-// It is the one-shot gate for work that must not be re-queued on every process
-// start, such as the virtual identity backfill. A failed job is deliberately
-// not "finished": the next boot re-queues it and the durable cursor resumes.
-func (r *Repository) HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error) {
-	var exists bool
-	if err := r.pool.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM admin_jobs WHERE job_type = $1 AND status IN ($2, $3)
-		)`,
-		jobType, StatusCompleted, StatusCancelled,
-	).Scan(&exists); err != nil {
-		return false, fmt.Errorf("check finished admin job of type: %w", err)
-	}
-	return exists, nil
 }
 
 func (r *Repository) GetActiveLibraryRefreshByLibraryID(ctx context.Context, libraryID int) (*models.AdminJob, error) {
@@ -748,7 +649,7 @@ func (r *Repository) Fail(ctx context.Context, id string, input FailJobInput) er
 
 func (r *Repository) Cancel(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled" //nolint:misspell // Job text shown beside the persisted cancelled status.
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -829,7 +730,7 @@ func (r *Repository) CancelState(ctx context.Context, id string) (cancelRequeste
 
 func (r *Repository) CancelQueued(ctx context.Context, id, message string, expiresAt time.Time) (*models.AdminJob, error) {
 	if message == "" {
-		message = "Admin job cancelled" //nolint:misspell // Job text shown beside the persisted cancelled status.
+		message = "Admin job canceled"
 	}
 	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
 		UPDATE admin_jobs
@@ -962,49 +863,6 @@ func (r *Repository) RequeueStaleRunning(ctx context.Context, before time.Time) 
 	return int(tag.RowsAffected() + interrupted), nil
 }
 
-// RequeueLatestFailedOfType resets the newest failed job of a kind to queued so
-// a boot retry resumes it, preserving its result payload. The identity backfill
-// persists a retriable watermark there; without this the boot gate would queue
-// a fresh job that restarts from zero and re-lists every unmatched row. It
-// clears the terminal retention deadline so the expired-job cleanup cannot
-// sweep the retry before it runs, and leaves an already-active job alone. It
-// reports whether a job was requeued.
-//
-// The outer `status = $3` re-checks the locked row's status: the subquery and
-// the NOT EXISTS guard are uncorrelated subplans the executor evaluates once,
-// before it takes the row lock, and does not re-run on the EvalPlanQual
-// recheck. Without the direct predicate a claim that commits while the requeue
-// waits for the lock would let it flip the now-running job back to queued.
-func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE admin_jobs
-		SET status = $2,
-			message = 'Requeued after a partial run',
-			error_message = '',
-			started_at = NULL,
-			completed_at = NULL,
-			heartbeat_at = NULL,
-			expires_at = NULL,
-			updated_at = NOW()
-		WHERE id = (
-			SELECT id FROM admin_jobs
-			WHERE job_type = $1 AND status = $3
-			ORDER BY requested_at DESC, id DESC
-			LIMIT 1
-		)
-		  AND status = $3
-		  AND NOT EXISTS (
-			SELECT 1 FROM admin_jobs
-			WHERE job_type = $1 AND status IN ($2, $4)
-		)`,
-		jobType, StatusQueued, StatusFailed, StatusRunning,
-	)
-	if err != nil {
-		return false, fmt.Errorf("requeueing latest failed admin job of type: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
 func (r *Repository) ListExpired(ctx context.Context, now time.Time, limit int) ([]*models.AdminJob, error) {
 	if limit <= 0 {
 		limit = 50
@@ -1123,4 +981,130 @@ func (r *Repository) CreateLibraryDeletion(ctx context.Context, userID int, req 
 		return nil, err
 	}
 	return job, nil
+}
+
+// CreateVirtualCandidatesRefresh persists one Refresh List job for a title.
+// A unique index (job_type, request_payload->>'content_id') enforces one active
+// job per title; a duplicate returns ActiveJobConflictError carrying the
+// already-active job so the caller can answer it like a coalesced command.
+func (r *Repository) CreateVirtualCandidatesRefresh(ctx context.Context, createdByUserID int, req VirtualCandidatesRefreshRequest, message string) (*models.AdminJob, error) {
+	payload, err := marshalPayload(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling virtual candidates refresh payload: %w", err)
+	}
+
+	id, err := idgen.NextID()
+	if err != nil {
+		return nil, fmt.Errorf("generate job id: %w", err)
+	}
+	job, err := scanAdminJob(r.pool.QueryRow(ctx, `
+		INSERT INTO admin_jobs (
+			id, job_type, status, created_by_user_id, request_payload, message
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING `+adminJobColumns,
+		id,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		createdByUserID,
+		payload,
+		message,
+	))
+	if err == nil {
+		return job, nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		activeJob, lookupErr := r.GetActiveVirtualRefreshByContentID(ctx, req.ContentID)
+		if lookupErr != nil && !errors.Is(lookupErr, ErrJobNotFound) {
+			return nil, lookupErr
+		}
+		return nil, &ActiveJobConflictError{Job: activeJob}
+	}
+
+	return nil, fmt.Errorf("creating virtual candidates refresh job: %w", err)
+}
+
+// GetActiveVirtualRefreshByContentID returns the queued or running Refresh
+// List job for a title, so a duplicate request coalesces onto it.
+func (r *Repository) GetActiveVirtualRefreshByContentID(ctx context.Context, contentID string) (*models.AdminJob, error) {
+	return scanAdminJob(r.pool.QueryRow(ctx, `
+		SELECT `+adminJobColumns+`
+		FROM admin_jobs
+		WHERE job_type = $1
+		  AND status IN ($2, $3)
+		  AND request_payload->>'content_id' = $4
+		ORDER BY requested_at ASC
+		LIMIT 1`,
+		JobTypeVirtualCandidatesRefresh,
+		StatusQueued,
+		StatusRunning,
+		contentID,
+	))
+}
+
+// HasFinishedJobOfType reports whether a job of this kind has reached a
+// terminal state the operator did not ask to retry: completed, or canceled.
+func (r *Repository) HasFinishedJobOfType(ctx context.Context, jobType string) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM admin_jobs WHERE job_type = $1 AND status IN ($2, $3)
+		)`,
+		jobType, StatusCompleted, StatusCancelled,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check finished admin job of type: %w", err)
+	}
+	return exists, nil
+}
+
+// LatestJobRequestedAt reports when a job of this kind was last requested.
+func (r *Repository) LatestJobRequestedAt(ctx context.Context, jobType string) (time.Time, bool, error) {
+	var requestedAt time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT requested_at FROM admin_jobs
+		WHERE job_type = $1
+		ORDER BY requested_at DESC, id DESC
+		LIMIT 1`,
+		jobType,
+	).Scan(&requestedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("latest admin job of type: %w", err)
+	}
+	return requestedAt, true, nil
+}
+
+// RequeueLatestFailedOfType re-queues the newest failed job of this kind for a
+// retry, unless one is already queued or running.
+func (r *Repository) RequeueLatestFailedOfType(ctx context.Context, jobType string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE admin_jobs
+		SET status = $2,
+			message = 'Requeued after a partial run',
+			error_message = '',
+			started_at = NULL,
+			completed_at = NULL,
+			heartbeat_at = NULL,
+			expires_at = NULL,
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM admin_jobs
+			WHERE job_type = $1 AND status = $3
+			ORDER BY requested_at DESC, id DESC
+			LIMIT 1
+		)
+		  AND status = $3
+		  AND NOT EXISTS (
+			SELECT 1 FROM admin_jobs
+			WHERE job_type = $1 AND status IN ($2, $4)
+		)`,
+		jobType, StatusQueued, StatusFailed, StatusRunning,
+	)
+	if err != nil {
+		return false, fmt.Errorf("requeueing latest failed admin job of type: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }

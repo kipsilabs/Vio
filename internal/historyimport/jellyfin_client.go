@@ -116,10 +116,13 @@ func (c *JellyfinClient) AuthenticateServerUser(ctx context.Context, baseURL, us
 	setJellyfinAuthorizationHeader(req, jellyfinAuthorizationHeader())
 	var resp jellyfinServerAuthResponse
 	if err := c.doJSON(req, &resp); err != nil {
+		if ctx.Err() == nil && isJSONDecodeError(err) {
+			return nil, fmt.Errorf("authenticating against Jellyfin server: %w: %w", ErrUnexpectedSourceResponse, err)
+		}
 		return nil, fmt.Errorf("authenticating against Jellyfin server: %w", err)
 	}
 	if strings.TrimSpace(resp.User.ID) == "" || strings.TrimSpace(resp.AccessToken) == "" {
-		return nil, fmt.Errorf("authenticating against Jellyfin server: incomplete auth response")
+		return nil, fmt.Errorf("authenticating against Jellyfin server: %w", ErrUnexpectedSourceResponse)
 	}
 	return &jellyfinLocalAuth{BaseURL: base, UserID: resp.User.ID, AccessToken: resp.AccessToken}, nil
 }
@@ -402,7 +405,7 @@ func (e *jellyfinHTTPError) Error() string {
 }
 
 func jellyfinAuthorizationHeader() string {
-	return `MediaBrowser Client="watch-importer", Device="Vio", DeviceId="vio-history-import", Version="1.0.0"`
+	return `MediaBrowser Client="watch-importer", Device="Silo", DeviceId="silo-history-import", Version="1.0.0"`
 }
 
 func jellyfinAuthorizationHeaderWithToken(token string) string {

@@ -525,12 +525,6 @@ func (c *classifier) evidenceForBody(body *ast.BlockStmt, pkg *pkgSource, origin
 			evidence.responseRedirect = true
 		case (qualified == "net/http.ServeContent" || qualified == "net/http.ServeFile" || qualified == "io.Copy" || qualified == "io.CopyN" || qualified == "io.CopyBuffer") && first&outgoingWriter != 0:
 			evidence.responseBinary = true
-		case qualified == c.set.modulePath+"/internal/playback.ServeSegmentLease" && first&outgoingWriter != 0:
-			// The segment handlers hand their writer to this helper, which
-			// serves the file through http.ServeContent after wrapping it. The
-			// wrapper hides the writer origin from the descent below, so the
-			// helper is named here as the binary answer it is.
-			evidence.responseBinary = true
 		case name == methodServeHTTP && args&outgoingWriter != 0:
 			evidence.responseBinary = true
 		case (name == "Upgrade" || name == "Accept") && args&outgoingWriter != 0 && args&incomingRequest != 0:
@@ -847,6 +841,9 @@ var traitOnlyRules = []authRule{
 var infrastructureMiddleware = []string{
 	"apimw.RequestID", mwRequestID, "middleware.Recoverer", "apimw.RequestLogger", "apimw.Metrics",
 	"httpstream.CompressExcept", "httpstream.CompressWithExclusions", "clientip.Middleware", "activitylog.NewMiddleware",
+	// apimw.Recoverer answers a handler's panic with a 500 inside the
+	// request recorders; it admits and refuses nothing.
+	"apimw.Recoverer",
 	// netaccess.Middleware validates and strips the network access ingress
 	// token on every listener; it records the access path and never grants
 	// or changes authorization.

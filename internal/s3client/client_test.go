@@ -1,13 +1,10 @@
 package s3client
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -534,118 +531,6 @@ func TestArtworkDeliveryScopeExcludesCredentials(t *testing.T) {
 	client.publicEndpoint = "https://other-images.example"
 	if got := client.ArtworkDeliveryScope(); got == scope {
 		t.Fatal("delivery endpoint change did not change scope")
-	}
-}
-
-// newDeleteObjectsFailureServer answers batch DeleteObjects requests with a
-// per-key error for each key in failures; every other requested key is treated
-// as deleted.
-func newDeleteObjectsFailureServer(t *testing.T, failures map[string]string) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		var request struct {
-			Objects []struct {
-				Key string `xml:"Key"`
-			} `xml:"Object"`
-		}
-		if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Errorf("decode delete request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		type deleteError struct {
-			Key     string `xml:"Key"`
-			Code    string `xml:"Code"`
-			Message string `xml:"Message"`
-		}
-		response := struct {
-			XMLName xml.Name      `xml:"DeleteResult"`
-			Errors  []deleteError `xml:"Error"`
-		}{}
-		for _, object := range request.Objects {
-			if code, ok := failures[object.Key]; ok {
-				response.Errors = append(response.Errors, deleteError{Key: object.Key, Code: code, Message: "test failure"})
-			}
-		}
-		w.Header().Set("Content-Type", "application/xml")
-		_ = xml.NewEncoder(w).Encode(response)
-	}))
-	t.Cleanup(server.Close)
-	return server
-}
-
-func TestDeleteObjectsTreatsAlreadyAbsentKeysAsSuccess(t *testing.T) {
-	server := newDeleteObjectsFailureServer(t, map[string]string{
-		"tmdb/movies/1/poster/original.a.webp": "NoSuchKey",
-		"tmdb/movies/1/poster/original.b.webp": "NotFound",
-	})
-	client := NewClient(BucketConfig{
-		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
-	})
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
-	deleted, err := client.DeleteObjects(context.Background(), "artwork", []string{
-		"tmdb/movies/1/poster/original.a.webp",
-		"tmdb/movies/1/poster/original.b.webp",
-	})
-	if err != nil {
-		t.Fatalf("DeleteObjects() error = %v, want nil for already-absent keys", err)
-	}
-	if deleted != 2 {
-		t.Fatalf("DeleteObjects() deleted = %d, want 2 (already absent)", deleted)
-	}
-	if strings.Contains(logs.String(), "partial failure") {
-		t.Fatalf("already-absent keys logged a partial-failure warning: %s", logs.String())
-	}
-}
-
-func TestDeleteObjectsCountsGenuineFailures(t *testing.T) {
-	server := newDeleteObjectsFailureServer(t, map[string]string{
-		"denied.webp":  "AccessDenied",
-		"missing.webp": "NoSuchKey",
-	})
-	client := NewClient(BucketConfig{
-		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
-	})
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
-	deleted, err := client.DeleteObjects(context.Background(), "artwork", []string{"denied.webp", "missing.webp", "ok.webp"})
-	if err == nil || !strings.Contains(err.Error(), "denied.webp") {
-		t.Fatalf("DeleteObjects() error = %v, want the denied key named", err)
-	}
-	if deleted != 2 {
-		t.Fatalf("DeleteObjects() deleted = %d, want 2 (one deleted, one already absent)", deleted)
-	}
-	if !strings.Contains(logs.String(), "key=denied.webp") {
-		t.Fatalf("genuine failure was not logged: %s", logs.String())
-	}
-	if strings.Contains(logs.String(), "key=missing.webp") || strings.Contains(logs.String(), "NoSuchKey") {
-		t.Fatalf("already-absent key was logged as a failure: %s", logs.String())
-	}
-}
-
-func TestDeleteObjectsCountsDeniedKeys(t *testing.T) {
-	server := newDeleteObjectsFailureServer(t, map[string]string{"denied.webp": "AccessDenied"})
-	client := NewClient(BucketConfig{
-		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
-	})
-
-	deleted, err := client.DeleteObjects(context.Background(), "artwork", []string{"denied.webp"})
-	if err == nil || !strings.Contains(err.Error(), "AccessDenied") {
-		t.Fatalf("DeleteObjects() error = %v, want AccessDenied", err)
-	}
-	if deleted != 0 {
-		t.Fatalf("DeleteObjects() deleted = %d, want 0", deleted)
 	}
 }
 

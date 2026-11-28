@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,7 +30,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -48,12 +48,12 @@ const (
 	// defaultEnrichBatchSize is the maximum number of audiobook items claimed
 	// per batch. A sweep runs batches back to back while books are due (see
 	// Enricher.sweep), so this bounds each claim's lease, not the sweep.
-	// Override with VIO_AUDIOBOOK_ENRICH_BATCH_SIZE (legacy SILO_AUDIOBOOK_ENRICH_BATCH_SIZE).
+	// Override with SILO_AUDIOBOOK_ENRICH_BATCH_SIZE.
 	defaultEnrichBatchSize = 250
 	// defaultEnrichWorkers is the default fan-out used by Enricher.Run.
 	// Network-bound: each worker holds one provider HTTP call at a time, so
 	// 4 is enough to mask single-request latency without hammering plugins.
-	// Override with VIO_AUDIOBOOK_ENRICH_WORKERS (legacy SILO_AUDIOBOOK_ENRICH_WORKERS).
+	// Override with SILO_AUDIOBOOK_ENRICH_WORKERS.
 	defaultEnrichWorkers = 4
 	// A whole batch is claimed before workers fan out. Keep the lease long
 	// enough for the final item in the default 250-item batch to reach its
@@ -68,7 +68,7 @@ const (
 
 // audiobookEnrichBatchSize returns the configured maximum sweep size.
 func audiobookEnrichBatchSize() int {
-	if v := envutil.GetenvFirst("VIO_AUDIOBOOK_ENRICH_BATCH_SIZE", "SILO_AUDIOBOOK_ENRICH_BATCH_SIZE"); v != "" {
+	if v := os.Getenv("SILO_AUDIOBOOK_ENRICH_BATCH_SIZE"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			return parsed
 		}
@@ -81,7 +81,7 @@ func audiobookEnrichBatchSize() int {
 // they drain.
 func audiobookEnrichWorkers(batchSize int) int {
 	n := defaultEnrichWorkers
-	if v := envutil.GetenvFirst("VIO_AUDIOBOOK_ENRICH_WORKERS", "SILO_AUDIOBOOK_ENRICH_WORKERS"); v != "" {
+	if v := os.Getenv("SILO_AUDIOBOOK_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}

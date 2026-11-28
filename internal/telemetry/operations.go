@@ -17,10 +17,10 @@ import (
 )
 
 var dependencyOperations = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "vio_dependency_operations_total", Help: "Dependency operations completed, including cancellation and timeout, by bounded category.",
+	Name: "silo_dependency_operations_total", Help: "Dependency operations completed, including cancellation and timeout, by bounded category.",
 }, []string{"dependency", "role", "operation", "outcome"})
 var dependencyDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name: "vio_dependency_duration_seconds", Help: "Dependency operation duration including client waits and retries; streamed bodies have separate byte accounting.",
+	Name: "silo_dependency_duration_seconds", Help: "Dependency operation duration including client waits and retries; streamed bodies have separate byte accounting.",
 	Buckets: []float64{.001, .005, .01, .05, .1, .5, 1, 5, 15, 60},
 }, []string{"dependency", "role", "operation"})
 
@@ -54,7 +54,7 @@ func Outcome(err error) string {
 func StartDependency(ctx context.Context, dependency, role, operation string) (context.Context, func(error)) {
 	role = Role(role)
 	start := time.Now()
-	ctx, span := otel.Tracer("vio/dependencies").Start(ctx, dependency+"."+operation,
+	ctx, span := otel.Tracer("silo/dependencies").Start(ctx, dependency+"."+operation,
 		trace.WithSpanKind(trace.SpanKindClient))
 	if span.IsRecording() {
 		span.SetAttributes(attribute.String("dependency", dependency), attribute.String("role", role), attribute.String("operation", operation))

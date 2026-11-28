@@ -233,7 +233,7 @@ func (r *Repository) CancelRunIfActive(ctx context.Context, runID string) error 
  error_message=CASE WHEN status='queued' THEN 'Cancelled by admin' ELSE error_message END
  WHERE id=$1 AND status IN ('queued','running')`, runID)
 	if err != nil {
-		return fmt.Errorf("canceling run %s: %w", runID, err)
+		return err
 	}
 	if result.RowsAffected() == 0 {
 		var status string

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Talk to a running Vio deployment — local or over SSH — using the settings in
+# Talk to a running Silo deployment — local or over SSH — using the settings in
 # `.silo-dev.env`. Run `scripts/silo-dev help` for the subcommands.
 set -euo pipefail
 
@@ -15,7 +15,7 @@ fi
 
 SILO_URL=${SILO_URL:-http://localhost:8090}
 SILO_SSH=${SILO_SSH:-}
-SILO_DIR=${SILO_DIR:-/opt/vio}
+SILO_DIR=${SILO_DIR:-/opt/silo}
 SILO_COMPOSE_FILE=${SILO_COMPOSE_FILE:-docker-compose.yml}
 SILO_SERVICE=${SILO_SERVICE:-silo}
 SILO_POSTGRES_SERVICE=${SILO_POSTGRES_SERVICE:-silo}
@@ -79,10 +79,10 @@ usage: scripts/silo-dev <command> [args]
 
   doctor                 check config and reachability, then report what works
   env                    print the resolved settings (secrets masked)
-  sh <command...>        run a shell command on the host running Vio
+  sh <command...>        run a shell command on the host running Silo
   compose <args...>      docker compose against the deployment's stack
-  logs [args...]         compose logs for the Vio service (default: --tail 200)
-  psql <sql>             run one SQL statement against the Vio database
+  logs [args...]         compose logs for the Silo service (default: --tail 200)
+  psql <sql>             run one SQL statement against the Silo database
   token                  print an access token for SILO_ADMIN_USER
   api <path> [curl...]   authenticated request as the admin's primary profile, e.g. api /api/v2/catalog
 

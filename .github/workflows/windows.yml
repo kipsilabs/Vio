@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
@@ -68,19 +68,23 @@ jobs:
             echo "::error::vips-cpp is not visible to pkg-config; the cgo build against libvips will fail."
             pkg-config --list-all 2>&1 | grep -i vips || echo "no vips entry in pkg-config --list-all"
             echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
-            ls /c/vips/lib 2>/dev/null || ls '/c/Program Files' | grep -i vips || true
+            ls /c/vips/lib 2>/dev/null || {
+              for d in '/c/Program Files'/*[Vv][Ii][Pp][Ss]*; do
+                [ -d "$d" ] && echo "$d"
+              done
+            } || true
             exit 1
           }
           vips --version || echo "vips binary not in PATH (library-only install is fine)"
           ffmpeg -hide_banner -version
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: web/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: pnpm
@@ -95,7 +99,7 @@ jobs:
         run: pnpm run build
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -159,7 +163,7 @@ jobs:
           ffmpeg -hide_banner -encoders 2>&1 | grep -i -E 'h264|hevc|av1' || true
 
       - name: Upload native server
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vio-windows-amd64-${{ github.sha }}
           path: |

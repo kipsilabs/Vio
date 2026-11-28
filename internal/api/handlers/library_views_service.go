@@ -245,6 +245,7 @@ func (h *SectionHandler) LibrarySections(ctx context.Context, libraryID int, vie
 	withItems = cutCappedSectionItems(withItems, viewer.ItemLimitCap)
 	withItems = applyDiversityFilter(withItems)
 	withItems = dropEmptySeasonalSections(withItems)
+	withItems = dropEmptySections(withItems)
 	return h.buildSections(ctx, withItems, &libraryID, viewer.Access, viewer.Artwork()), nil
 }
 

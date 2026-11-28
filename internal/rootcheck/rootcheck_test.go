@@ -11,31 +11,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/fspath"
 )
 
-func TestProbeVirtualRoots(t *testing.T) {
-	t.Parallel()
-
-	// Both slash forms must be treated as reachable virtual roots without
-	// touching the filesystem. The single-slash form is what older writes
-	// produced when filepath.Clean collapsed the scheme.
-	for _, path := range []string{
-		"virtual://movies",
-		"virtual://series",
-		"virtual:/movies",
-		"virtual:/series",
-		"VIRTUAL://Movies",
-		" virtual:/movies ",
-		"virtual",
-	} {
-		res := Probe(path)
-		if !res.Reachable || !res.Empty {
-			t.Errorf("Probe(%q) = %+v, want reachable+empty", path, res)
-		}
-		if !IsVirtualRootPath(path) {
-			t.Errorf("IsVirtualRootPath(%q) = false, want true", path)
-		}
-	}
-}
-
 func TestProbeMissingPath(t *testing.T) {
 	t.Parallel()
 

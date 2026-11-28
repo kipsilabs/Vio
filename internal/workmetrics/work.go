@@ -36,13 +36,13 @@ const (
 	legacyCanceled        = "cancelled" //nolint:misspell // Existing durable job wire status.
 )
 
-var active = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "vio_work_active", Help: "Work attempts currently executing in this process; sum across instances."}, []string{labelWorkload})
-var completed = promauto.NewCounterVec(prometheus.CounterOpts{Name: "vio_work_attempts_total", Help: "Finished execution attempts; unknown means no confirmed terminal outcome."}, []string{labelWorkload, "outcome"})
-var duration = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "vio_work_duration_seconds", Help: "Wall time per execution attempt.", Buckets: []float64{.01, .1, 1, 5, 15, 60, 300, 900, 3600}}, []string{labelWorkload})
-var queueWait = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "vio_work_queue_wait_seconds", Help: "Age from durable request time to attempt start; includes retries.", Buckets: []float64{.1, 1, 5, 15, 60, 300, 900, 3600, 86400}}, []string{labelWorkload})
-var progress = promauto.NewCounterVec(prometheus.CounterOpts{Name: "vio_work_progress_updates_total", Help: "Observed progress updates; heartbeats are excluded."}, []string{labelWorkload})
-var lastProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "vio_work_last_progress_timestamp_seconds", Help: "Last observed progress or attempt start in this process. Aggregate progress cannot prove that every concurrent job advances."}, []string{labelWorkload})
-var recoveries = promauto.NewCounterVec(prometheus.CounterOpts{Name: "vio_work_recoveries_total", Help: "Durable stale claims recovered by this process."}, []string{labelWorkload})
+var active = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "silo_work_active", Help: "Work attempts currently executing in this process; sum across instances."}, []string{labelWorkload})
+var completed = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_work_attempts_total", Help: "Finished execution attempts; unknown means no confirmed terminal outcome."}, []string{labelWorkload, "outcome"})
+var duration = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "silo_work_duration_seconds", Help: "Wall time per execution attempt.", Buckets: []float64{.01, .1, 1, 5, 15, 60, 300, 900, 3600}}, []string{labelWorkload})
+var queueWait = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "silo_work_queue_wait_seconds", Help: "Age from durable request time to attempt start; includes retries.", Buckets: []float64{.1, 1, 5, 15, 60, 300, 900, 3600, 86400}}, []string{labelWorkload})
+var progress = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_work_progress_updates_total", Help: "Observed progress updates; heartbeats are excluded."}, []string{labelWorkload})
+var lastProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{Name: "silo_work_last_progress_timestamp_seconds", Help: "Last observed progress or attempt start in this process. Aggregate progress cannot prove that every concurrent job advances."}, []string{labelWorkload})
+var recoveries = promauto.NewCounterVec(prometheus.CounterOpts{Name: "silo_work_recoveries_total", Help: "Durable stale claims recovered by this process."}, []string{labelWorkload})
 
 // Category folds dynamic plugin task keys and future tasks into finite categories.
 // Do not add identities (provider slugs, job IDs, paths) to this vocabulary.
@@ -118,7 +118,7 @@ func Start(ctx context.Context, workload string, queuedAt time.Time) (context.Co
 	if parent := trace.SpanContextFromContext(ctx); parent.IsValid() {
 		opts = append(opts, trace.WithLinks(trace.Link{SpanContext: parent}))
 	}
-	ctx, span := otel.Tracer("vio/work").Start(telemetry.PublicContext(ctx), "work."+category, opts...)
+	ctx, span := otel.Tracer("silo/work").Start(telemetry.PublicContext(ctx), "work."+category, opts...)
 	run := &Run{parent: parentCtx, category: category, start: time.Now(), span: span}
 	active.WithLabelValues(category).Inc()
 	if !queuedAt.IsZero() && !queuedAt.After(run.start) {

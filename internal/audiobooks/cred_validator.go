@@ -12,6 +12,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/audiobooks/abs"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/auth/passwordhash"
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
@@ -108,7 +109,7 @@ func (v *SiloCredValidator) Validate(
 		return principal, nil
 	}
 
-	if profile.PINHash != "" { //nolint:nestif // upstream Validate in cred_validator.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if profile.PINHash != "" { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		if pin == "" {
 			return abs.Principal{}, abs.ErrProfilePINRequired
 		}
@@ -261,4 +262,20 @@ func splitUserProfile(raw string) (user, profile string) {
 		return raw, ""
 	}
 	return strings.TrimSpace(raw[:i]), strings.TrimSpace(raw[i+1:])
+}
+
+// IsAdmin reports whether the account is an administrator.
+func (v *SiloCredValidator) IsAdmin(ctx context.Context, userID string) (bool, error) {
+	if v.Pool == nil {
+		return false, errors.New("abs: no account store")
+	}
+	uid, err := strconv.Atoi(userID)
+	if err != nil {
+		return false, fmt.Errorf("abs: invalid user id %q: %w", userID, err)
+	}
+	var role string
+	if err := v.Pool.QueryRow(ctx, `SELECT role FROM users WHERE id = $1`, uid).Scan(&role); err != nil {
+		return false, err
+	}
+	return role == models.RoleAdmin, nil
 }

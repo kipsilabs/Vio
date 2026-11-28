@@ -214,7 +214,7 @@ func (p *parsedNFO) clone() *parsedNFO {
 // the provider by directory modification time, so a flat folder of thousands
 // of movies is listed once per change rather than once per item and phase.
 type sidecarLookup struct {
-	ctx      context.Context //nolint:containedctx // Lookup is per provider call; carrying the request context is deliberate.
+	ctx      context.Context //nolint:containedctx // A per-request lookup caches sidecar reads under the caller's context.
 	provider *Provider
 	listings map[string]*dirListing // this call's listings, without re-statting
 	stacks   map[stackKey]bool      // this call's isStacked answers
@@ -494,7 +494,9 @@ func (l *sidecarLookup) load(path string) (*parsedNFO, error) {
 // the save.
 func readNFOFile(path string) ([]byte, error) {
 	f, err := fspath.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if errors.Is(err, syscall.ELOOP) {
+	// Linux and macOS report ELOOP for a symlink opened with O_NOFOLLOW;
+	// FreeBSD reports EMLINK.
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
 		return nil, errNFOReplaced
 	}
 	if err != nil {
@@ -567,7 +569,7 @@ func isAbsent(err error) bool {
 }
 
 func unavailable(path string, err error) error {
-	return fmt.Errorf("%w: %w", metadata.ErrLocalMetadataUnavailable, &metadata.LocalMetadataPathError{Path: path, Err: err})
+	return fmt.Errorf("%w: %s: %w", metadata.ErrLocalMetadataUnavailable, path, err)
 }
 
 // directoryNFONames lists the directory-level NFO names for a content type.
@@ -605,7 +607,7 @@ func (l *sidecarLookup) findItemNFO(mediaFiles, sidecarDirs []string, contentTyp
 		candidates = append(candidates, candidate{dir, name})
 	}
 	var firstErr error
-	if contentType != typeSeries { //nolint:nestif // upstream findItemNFO in lookup.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if contentType != typeSeries { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		var stacks []candidate
 		for _, file := range mediaFiles {
 			if err := mediaPresent(file); err != nil {

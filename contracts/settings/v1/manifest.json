@@ -442,12 +442,7 @@
       "key": "playback.subtitle_mode",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile",
-        "profile_device",
-        "profile_library",
-        "profile_series"
-      ],
+      "allowed_scopes": ["profile", "profile_device", "profile_library", "profile_series"],
       "resolution_order": [
         "profile_series",
         "profile_library",
@@ -458,26 +453,17 @@
       "value_schema": {
         "type": "enum",
         "values": [
-          {
-            "value": "auto",
-            "label": "Auto"
-          },
-          {
-            "value": "always",
-            "label": "Always on"
-          },
-          {
-            "value": "off",
-            "label": "Off"
-          }
+          { "value": "auto", "label": "Auto" },
+          { "value": "always", "label": "Always on" },
+          { "value": "off", "label": "Off" }
         ]
       },
-      "default_value": "off",
+      "default_value": "auto",
       "category": "playback",
       "label": "Subtitles",
       "description": "When Silo should turn subtitles on.",
       "recommended_control": "select",
-      "notes": "Revision 11 changed default_value from auto to off to prevent startup playback stalls and delayed extraction. The legacy empty string means unset, not a fourth mode. Migration maps \"\" to no stored row so it resolves to the next scope."
+      "notes": "The legacy empty string means unset, not a fourth mode. Migration maps \"\" to no stored row so it resolves to the next scope."
     },
     {
       "key": "playback.show_forced_subtitles",
@@ -503,19 +489,9 @@
       "key": "playback.subtitle_appearance",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile",
-        "profile_device"
-      ],
-      "resolution_order": [
-        "profile_device",
-        "profile",
-        "default"
-      ],
-      "value_schema": {
-        "type": "object",
-        "schema_ref": "subtitle-appearance.json"
-      },
+      "allowed_scopes": ["profile", "profile_device"],
+      "resolution_order": ["profile_device", "profile", "default"],
+      "value_schema": { "type": "object", "schema_ref": "subtitle-appearance.json" },
       "default_value": {
         "fontSize": "large",
         "fontFamily": "sans-serif",
@@ -532,49 +508,24 @@
       "label": "Subtitle appearance",
       "description": "How subtitles are drawn during playback.",
       "recommended_control": "panel",
-      "notes": "Renamed from the unprefixed legacy key \"subtitle_appearance\". Every other canonical key carries a domain prefix, and preserving accidental key names is an explicit non-goal of the design. The rename touches three URL paths in internal/api/router.go, the admin device-settings routes, and the key constant in every client, so it cannot land without them. Migration copies the account-level legacy fallback to every existing profile and leaves device overrides unchanged, rewriting the key on each row. Revision 6 changes the fallback background from shadow to a 75% opaque box, matching the previous intended web default and the current Apple fallback. Connected clients receive the complete effective default from the server; clients should adopt revision 6 so their local and sparse-object decoding fallbacks match it. Stored profile and device overrides remain authoritative."
+      "notes": "Renamed from the unprefixed legacy key \"subtitle_appearance\". Every other canonical key carries a domain prefix, and preserving accidental key names is an explicit non-goal of the design. The rename touches three URL paths in internal/api/router.go, the admin device-settings routes, and the key constant in every client, so it cannot land without them. Migration copies the account-level legacy fallback to every existing profile and leaves device overrides unchanged, rewriting the key on each row. Revision 6 changes the fallback background from shadow to a 75% opaque box, matching the previous intended web default and the current Apple fallback. Connected clients receive the complete effective default from the server; clients should adopt revision 6 so their local and sparse-object decoding fallbacks match it. Stored profile and device overrides remain authoritative. Revision 14 adds the optional textOpacity property (1-100, default 100) controlling the opacity of the subtitle text itself, independent of backgroundOpacity; a value stored without it resolves to fully opaque text, matching pre-14 rendering."
     },
     {
       "key": "playback.preferred_quality",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile",
-        "profile_device"
-      ],
-      "resolution_order": [
-        "profile_device",
-        "profile",
-        "default"
-      ],
+      "allowed_scopes": ["profile", "profile_device"],
+      "resolution_order": ["profile_device", "profile", "default"],
       "value_schema": {
         "type": "enum",
         "ordered": true,
         "values": [
-          {
-            "value": "auto",
-            "label": "Auto"
-          },
-          {
-            "value": "480p",
-            "label": "480p"
-          },
-          {
-            "value": "720p",
-            "label": "720p"
-          },
-          {
-            "value": "1080p",
-            "label": "1080p"
-          },
-          {
-            "value": "2160p",
-            "label": "2160p / 4K"
-          },
-          {
-            "value": "original",
-            "label": "Original quality"
-          }
+          { "value": "auto", "label": "Auto" },
+          { "value": "480p", "label": "480p" },
+          { "value": "720p", "label": "720p" },
+          { "value": "1080p", "label": "1080p" },
+          { "value": "2160p", "label": "2160p / 4K" },
+          { "value": "original", "label": "Original quality", "deprecated": true }
         ]
       },
       "default_value": "auto",
@@ -586,7 +537,7 @@
       "label": "Preferred quality",
       "description": "Pick the quality Silo should prefer.",
       "recommended_control": "select",
-      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent \u2014 they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings."
+      "notes": "The resolution axis. Members are exactly the vocabulary the server already speaks: NormalizeQualityV3 in internal/playback/protocol_v3.go accepts auto, 480p, 720p, 1080p, 2160p and original and normalizes anything else to auto with a degradation warning. Transcode ladder rungs (328p, 720p-high, 1080p-8 and friends) are deliberately absent — they were never a third dimension, only a bitrate spelled into the resolution string. web/src/player/hooks/useTranscodeQuality.ts already decomposes them, defining 1080p-high as {resolution: 1080p, bitrate: 10000} and sending the two to the server separately, so the compound form never reached the wire. playback.max_bitrate_kbps is now that second axis, and clients compose the two into whatever presets they want to show. Members are listed ascending so the ceiling constraint has a defined direction; \"auto\" sorts lowest because it never exceeds a cap, and \"original\" highest because it is the uncapped source. Enforcing the ceiling needs internal/access/quality.go to learn both sentinels: qualityRank ranks neither today, so auto and original both tie at 0 with unset and a cap would let original through. Migrates user_profiles.quality_preference as the profile fallback. The legacy column is NOT NULL DEFAULT '1080p', and that default was the effective playback cap, so existing profiles receive explicit 1080p and 6000 kbps rows; newly created profiles use the contract's auto/null defaults. The account/profile max_playback_quality columns stay in internal/policy and are NOT settings. Revision 20 deprecates \"original\": Auto with no bitrate cap already plays the source whenever the device can, so the separate choice only confused people. The value stays valid so older clients can still write it, the planner treats it as auto, a migration rewrote stored values to auto, and clients no longer offer it."
     },
     {
       "key": "playback.max_bitrate_kbps",
@@ -828,22 +779,15 @@
       "key": "catalog.show_advisory_age",
       "introduced_in": 10,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile"
-      ],
-      "resolution_order": [
-        "profile",
-        "default"
-      ],
-      "value_schema": {
-        "type": "boolean"
-      },
+      "allowed_scopes": ["profile"],
+      "resolution_order": ["profile", "default"],
+      "value_schema": { "type": "boolean" },
       "default_value": false,
       "category": "catalog",
       "label": "Show advisory age",
       "description": "Show a recommended minimum viewer age from an advisory service, such as Common Sense Media, on item detail.",
       "recommended_control": "switch",
-      "notes": "Profile scope because the reader is a household parent deciding what a child may watch, and they browse on their own profile. Default false: the advisory is extra chrome most viewers do not want, and only the profiles that ask for it should carry it. Display only. The advisory age never feeds content_rating_age, ApplyContentRatingCeiling, or any other parental control, so turning this on cannot change what a profile is allowed to watch, and turning it off hides nothing that was restricting anything. Coverage is partial by nature: the provider that supplies the advisory is rate limited per day, so on a large library some titles carry one and others do not."
+      "notes": "Profile scope because the reader is a household parent deciding what a child may watch, and they browse on their own profile. Default false: the advisory is extra chrome most viewers do not want, and only the profiles that ask for it should carry it. This setting only controls whether the badge is shown: turning it on or off never changes what a profile is allowed to watch. Restricting a profile by advisory age is a separate access field, the profile's max_advisory_age, which a household manager sets on the profile itself. Coverage is partial by nature: the provider that supplies the advisory is rate limited per day, so on a large library some titles carry one and others do not."
     },
     {
       "key": "catalog.hide_unwatched_episode_images",
@@ -1052,50 +996,26 @@
       "key": "ui.theme",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile",
-        "profile_device"
-      ],
-      "resolution_order": [
-        "profile_device",
-        "profile",
-        "default"
-      ],
+      "allowed_scopes": ["profile", "profile_device"],
+      "resolution_order": ["profile_device", "profile", "default"],
       "value_schema": {
         "type": "enum",
         "values": [
-          {
-            "value": "midnight-cinema",
-            "label": "Midnight Cinema"
-          },
-          {
-            "value": "cinema-light",
-            "label": "Cinema Light"
-          },
-          {
-            "value": "cobalt-studio",
-            "label": "Cobalt Studio"
-          },
-          {
-            "value": "oxblood-noir",
-            "label": "Oxblood Noir"
-          },
-          {
-            "value": "evergreen-studio",
-            "label": "Evergreen Studio"
-          }
+          { "value": "midnight-cinema", "label": "Midnight Cinema" },
+          { "value": "cinema-light", "label": "Cinema Light" },
+          { "value": "cobalt-studio", "label": "Cobalt Studio" },
+          { "value": "oxblood-noir", "label": "Oxblood Noir" },
+          { "value": "evergreen-studio", "label": "Evergreen Studio" }
         ]
       },
       "default_value": "midnight-cinema",
-      "platforms": [
-        "web"
-      ],
+      "platforms": ["web"],
       "category": "appearance",
       "label": "Theme",
       "description": "Colour theme for the Silo interface.",
       "recommended_control": "select",
       "deprecated": true,
-      "notes": "Deprecated in revision 15: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_theme\" at the settings cutover."
+      "notes": "Deprecated in revision 12: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_theme\" at the settings cutover."
     },
     {
       "key": "ui.text_scale",
@@ -1160,55 +1080,37 @@
       "key": "ui.custom_theme_vars",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile"
-      ],
-      "resolution_order": [
-        "profile",
-        "default"
-      ],
+      "allowed_scopes": ["profile"],
+      "resolution_order": ["profile", "default"],
       "value_schema": {
         "type": "object",
         "schema_ref": "theme-var-overrides.json",
         "nullable": true
       },
       "default_value": null,
-      "platforms": [
-        "web"
-      ],
+      "platforms": ["web"],
       "category": "appearance",
       "label": "Custom theme variables",
       "description": "Per-token overrides applied on top of the selected theme.",
       "recommended_control": "panel",
       "deprecated": true,
-      "notes": "Deprecated in revision 15: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_custom_theme_vars\", which stored arbitrary unvalidated JSON."
+      "notes": "Deprecated in revision 12: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_custom_theme_vars\", which stored arbitrary unvalidated JSON."
     },
     {
       "key": "ui.custom_css",
       "introduced_in": 1,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile"
-      ],
-      "resolution_order": [
-        "profile",
-        "default"
-      ],
-      "value_schema": {
-        "type": "string",
-        "max_length": 65536,
-        "nullable": true
-      },
+      "allowed_scopes": ["profile"],
+      "resolution_order": ["profile", "default"],
+      "value_schema": { "type": "string", "max_length": 65536, "nullable": true },
       "default_value": null,
-      "platforms": [
-        "web"
-      ],
+      "platforms": ["web"],
       "category": "appearance",
       "label": "Custom CSS",
       "description": "Raw CSS applied on top of the selected theme.",
       "recommended_control": "text",
       "deprecated": true,
-      "notes": "Deprecated in revision 15: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_custom_css\". The contract only bounds length."
+      "notes": "Deprecated in revision 12: the web client has one theme, Cinema Dark, which only the admin customizes (accent color plus the ui.admin_theme_vars and ui.admin_custom_css server settings), and it no longer reads or writes this key. Web-only (platforms: web). Stored values were deleted by migration 20260926233851_retire_profile_themes (SQLite user store schema v29). The definition stays published so a stale cached web bundle's write is accepted rather than failing; nothing reads what it stores. Renamed from the unregistered legacy key \"ui_custom_css\". The contract only bounds length."
     },
     {
       "key": "ui.date_format",
@@ -1271,27 +1173,13 @@
     },
     {
       "key": "home.hide_watched_items",
-      "introduced_in": 15,
+      "introduced_in": 12,
       "persistence": "remote",
-      "allowed_scopes": [
-        "profile"
-      ],
-      "resolution_order": [
-        "profile",
-        "default"
-      ],
-      "value_schema": {
-        "type": "boolean"
-      },
+      "allowed_scopes": ["profile"],
+      "resolution_order": ["profile", "default"],
+      "value_schema": { "type": "boolean" },
       "default_value": false,
-      "platforms": [
-        "web",
-        "ios",
-        "tvos",
-        "macos",
-        "android",
-        "android_tv"
-      ],
+      "platforms": ["web", "ios", "tvos", "macos", "android", "android_tv"],
       "category": "navigation",
       "label": "Hide watched items from Home",
       "description": "Remove watched items from ordinary Home sections while keeping Featured and watch-history sections unchanged.",
@@ -1776,6 +1664,26 @@
       "notes": "The profile scope deliberately resolves before profile_device: a profile value is the profile's \"apply to all devices\" choice and wins on every device, while with no profile value each device follows its own profile_device value. Clients show a second \"Apply to all devices\" switch whose state is the effective source being profile. Turning it on writes the current value at profile scope; while on, the main switch writes profile scope. Turning it off writes the current value at profile_device for the device doing it and then clears the profile value, so that device keeps its look and every other device returns to its own value or the default. Device values written earlier are kept while the profile value is set and apply again once it is cleared. Covers every surface that names a title with its logo (detail heroes, TV marquees); a client that turns it off also has no reason to prefetch logos. The administrator can replace the default for the whole server; a profile or device with no stored value inherits it with source \"default\", and clearing both the profile value and this device's value returns a device to it."
     },
     {
+      "key": "watch_party.guest_control_policy",
+      "introduced_in": 27,
+      "persistence": "remote",
+      "allowed_scopes": ["profile"],
+      "resolution_order": ["profile", "default"],
+      "value_schema": {
+        "type": "enum",
+        "values": [
+          { "value": "host_only", "label": "Host only" },
+          { "value": "guest_play_pause", "label": "Host and guests" }
+        ]
+      },
+      "default_value": "host_only",
+      "category": "watch_party",
+      "label": "Watch Party playback controls",
+      "description": "Who can play and pause in Watch Parties you host. Changing it in a party saves it for your next one.",
+      "recommended_control": "select",
+      "notes": "The server reads it when the profile creates a Watch Party room and starts the room with this guest_control_policy instead of always host_only. The server also writes it at profile scope whenever the host changes a room's policy (updateWatchTogetherRoomPolicy), so the choice made in any client's party options carries to the next party on every client without each client storing or sending it. Profile scope because each household member hosts with their own choice. The enum members are the room's guest_control_policy values."
+    },
+    {
       "key": "playback.version_sort",
       "introduced_in": 10,
       "persistence": "remote",
@@ -1797,116 +1705,6 @@
       "description": "Choose how the versions of an item are ordered for you.",
       "recommended_control": "panel",
       "notes": "Profile-scope viewer preference for the per-item version list. The server stores and resolves it but never evaluates it: the watch payload carries the criteria, and the version list applies them client-side over the versions it already has, so an attribute the payload does not expose cannot be honoured. The attribute set is therefore restricted to size, bitrate, resolution, audio_channels, bit_depth, hdr and score, matching the watch payload's sortable fields rather than the wider quality-profile vocabulary (source, confirmed, language). An empty list and an absent/null value are equivalent and mean \"no override\": the list keeps the ranking the selected quality profile returns. The 16-entry cap matches the quality-profile sort cap (maxSortCriteria in internal/virtuallibrary/quality). Duplicate attribute/direction pairs are allowed, as they are in a quality profile; they simply do not change the order. No migration: this is a new key with no legacy column, and it is nullable so a profile with no row inherits the profile ranking."
-    },
-{
-      "key": "remuxdb.base_url",
-      "introduced_in": 9,
-      "persistence": "remote",
-      "allowed_scopes": [
-        "account"
-      ],
-      "resolution_order": [
-        "account",
-        "default"
-      ],
-      "value_schema": {
-        "type": "string",
-        "max_length": 2048
-      },
-      "default_value": "https://remuxdb.1632022.xyz",
-      "category": "providers",
-      "label": "RemuxDB base URL",
-      "description": "Base URL of the RemuxDB API service.",
-      "recommended_control": "text",
-      "deprecated": true,
-      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
-    },
-{
-      "key": "remuxdb.enabled",
-      "introduced_in": 9,
-      "persistence": "remote",
-      "allowed_scopes": [
-        "account"
-      ],
-      "resolution_order": [
-        "account",
-        "default"
-      ],
-      "value_schema": {
-        "type": "boolean"
-      },
-      "default_value": false,
-      "category": "providers",
-      "label": "RemuxDB stream metadata",
-      "description": "Look up crowdsourced stream metadata for cold virtual files.",
-      "recommended_control": "switch",
-      "deprecated": true,
-      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
-    },
-{
-      "key": "remuxdb.submit_enabled",
-      "introduced_in": 9,
-      "persistence": "remote",
-      "allowed_scopes": [
-        "account"
-      ],
-      "resolution_order": [
-        "account",
-        "default"
-      ],
-      "value_schema": {
-        "type": "boolean"
-      },
-      "default_value": false,
-      "category": "providers",
-      "label": "Contribute to RemuxDB",
-      "description": "Submit probed stream metadata to RemuxDB to help the community.",
-      "recommended_control": "switch",
-      "deprecated": true,
-      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
-    },
-{
-      "key": "remuxdb.token",
-      "introduced_in": 9,
-      "persistence": "remote",
-      "allowed_scopes": [
-        "account"
-      ],
-      "resolution_order": [
-        "account",
-        "default"
-      ],
-      "value_schema": {
-        "type": "string",
-        "max_length": 1024
-      },
-      "default_value": "",
-      "category": "providers",
-      "label": "RemuxDB API token",
-      "description": "API token for RemuxDB submissions.",
-      "recommended_control": "text",
-      "deprecated": true,
-      "notes": "Removed in revision 17: the RemuxDB integration was deleted and the key is ignored."
-    },
-    {
-      "key": "watch_party.guest_control_policy",
-      "introduced_in": 27,
-      "persistence": "remote",
-      "allowed_scopes": ["profile"],
-      "resolution_order": ["profile", "default"],
-      "value_schema": {
-        "type": "enum",
-        "values": [
-          { "value": "host_only", "label": "Host only" },
-          { "value": "guest_play_pause", "label": "Host and guests" }
-        ]
-      },
-      "default_value": "host_only",
-      "category": "watch_party",
-      "label": "Watch Party playback controls",
-      "description": "Who can play and pause in Watch Parties you host. Changing it in a party saves it for your next one.",
-      "recommended_control": "select",
-      "notes": "The server reads it when the profile creates a Watch Party room and starts the room with this guest_control_policy instead of always host_only. The server also writes it at profile scope whenever the host changes a room's policy (updateWatchTogetherRoomPolicy), so the choice made in any client's party options carries to the next party on every client without each client storing or sending it. Profile scope because each household member hosts with their own choice. The enum members are the room's guest_control_policy values."
     }
   ]
 }

@@ -2,6 +2,7 @@ package streamtelemetry
 
 import (
 	"log/slog"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,38 +13,22 @@ import (
 )
 
 const (
-	enabledEnv            = "VIO_STREAM_TELEMETRY_ENABLED"
-	enabledEnvLegacy      = "SILO_STREAM_TELEMETRY_ENABLED"
-	familiesEnv           = "VIO_STREAM_TELEMETRY_FAMILIES"
-	familiesEnvLegacy     = "SILO_STREAM_TELEMETRY_FAMILIES"
-	sweepIntervalEnv      = "VIO_STREAM_TELEMETRY_SWEEP_INTERVAL"
-	sweepIntervalEnvOld   = "SILO_STREAM_TELEMETRY_SWEEP_INTERVAL"
-	retentionEnv          = "VIO_STREAM_TELEMETRY_RETENTION"
-	retentionEnvLegacy    = "SILO_STREAM_TELEMETRY_RETENTION"
-	maxSessionsEnv        = "VIO_STREAM_TELEMETRY_MAX_SESSIONS"
-	maxSessionsEnvLegacy  = "SILO_STREAM_TELEMETRY_MAX_SESSIONS"
-	maxTransfersEnv       = "VIO_STREAM_TELEMETRY_MAX_TRANSFERS"
-	maxTransfersEnvLegacy = "SILO_STREAM_TELEMETRY_MAX_TRANSFERS"
-	maxObservationsEnv    = "VIO_STREAM_TELEMETRY_MAX_OBSERVATIONS"
-	maxObservationsOld    = "SILO_STREAM_TELEMETRY_MAX_OBSERVATIONS"
-	distributedEnv        = "VIO_STREAM_TELEMETRY_DISTRIBUTED"
-	distributedEnvLegacy  = "SILO_STREAM_TELEMETRY_DISTRIBUTED"
-	freshnessEnv          = "VIO_STREAM_TELEMETRY_FRESHNESS"
-	freshnessEnvLegacy    = "SILO_STREAM_TELEMETRY_FRESHNESS"
-	membershipTTLEnv      = "VIO_STREAM_TELEMETRY_MEMBERSHIP_TTL"
-	membershipTTLLegacy   = "SILO_STREAM_TELEMETRY_MEMBERSHIP_TTL"
-	keyPrefixEnv          = "VIO_STREAM_TELEMETRY_KEY_PREFIX"
-	keyPrefixEnvLegacy    = "SILO_STREAM_TELEMETRY_KEY_PREFIX"
-	fullResyncEveryEnv    = "VIO_STREAM_TELEMETRY_FULL_RESYNC_EVERY"
-	fullResyncEveryOld    = "SILO_STREAM_TELEMETRY_FULL_RESYNC_EVERY"
-	maxPublishersEnv      = "VIO_STREAM_TELEMETRY_MAX_PUBLISHERS"
-	maxPublishersOld      = "SILO_STREAM_TELEMETRY_MAX_PUBLISHERS"
-	maxMergedSessionsEnv  = "VIO_STREAM_TELEMETRY_MAX_MERGED_SESSIONS"
-	maxMergedSessionsOld  = "SILO_STREAM_TELEMETRY_MAX_MERGED_SESSIONS"
-	maxMergedTransfersEnv = "VIO_STREAM_TELEMETRY_MAX_MERGED_TRANSFERS"
-	maxMergedTransfersOld = "SILO_STREAM_TELEMETRY_MAX_MERGED_TRANSFERS"
-	viewTTLEnv            = "VIO_STREAM_TELEMETRY_VIEW_TTL"
-	viewTTLEnvLegacy      = "SILO_STREAM_TELEMETRY_VIEW_TTL"
+	enabledEnv            = "SILO_STREAM_TELEMETRY_ENABLED"
+	familiesEnv           = "SILO_STREAM_TELEMETRY_FAMILIES"
+	sweepIntervalEnv      = "SILO_STREAM_TELEMETRY_SWEEP_INTERVAL"
+	retentionEnv          = "SILO_STREAM_TELEMETRY_RETENTION"
+	maxSessionsEnv        = "SILO_STREAM_TELEMETRY_MAX_SESSIONS"
+	maxTransfersEnv       = "SILO_STREAM_TELEMETRY_MAX_TRANSFERS"
+	maxObservationsEnv    = "SILO_STREAM_TELEMETRY_MAX_OBSERVATIONS"
+	distributedEnv        = "SILO_STREAM_TELEMETRY_DISTRIBUTED"
+	freshnessEnv          = "SILO_STREAM_TELEMETRY_FRESHNESS"
+	membershipTTLEnv      = "SILO_STREAM_TELEMETRY_MEMBERSHIP_TTL"
+	keyPrefixEnv          = "SILO_STREAM_TELEMETRY_KEY_PREFIX"
+	fullResyncEveryEnv    = "SILO_STREAM_TELEMETRY_FULL_RESYNC_EVERY"
+	maxPublishersEnv      = "SILO_STREAM_TELEMETRY_MAX_PUBLISHERS"
+	maxMergedSessionsEnv  = "SILO_STREAM_TELEMETRY_MAX_MERGED_SESSIONS"
+	maxMergedTransfersEnv = "SILO_STREAM_TELEMETRY_MAX_MERGED_TRANSFERS"
+	viewTTLEnv            = "SILO_STREAM_TELEMETRY_VIEW_TTL"
 )
 
 type Config struct {
@@ -106,7 +91,7 @@ const defaultFreshness = 5 * time.Second
 func DefaultConfig(nodeID string) Config {
 	return Config{
 		NodeID: nodeID, SweepInterval: time.Second, Retention: 5 * time.Minute,
-		Freshness: defaultFreshness, MembershipTTL: time.Minute, KeyPrefix: "vio:stelem",
+		Freshness: defaultFreshness, MembershipTTL: time.Minute, KeyPrefix: "silo:stelem",
 		ViewTTL:         DefaultViewTTL,
 		FullResyncEvery: 60, MaxPublishers: 256, MaxMergedSessions: 50_000, MaxMergedTransfers: 50_000,
 		MaxSessions: 10_000, MaxTransfers: 10_000, MaxObservations: 50_000,
@@ -119,14 +104,13 @@ func DefaultConfig(nodeID string) Config {
 }
 
 // ConfigFromEnv returns a safe configuration. Telemetry is on unless
-// VIO_STREAM_TELEMETRY_ENABLED turns it off (SILO_* legacy honored), and
-// distributed mode is left for
+// SILO_STREAM_TELEMETRY_ENABLED turns it off, and distributed mode is left for
 // the caller to derive from Redis availability unless the operator pinned
-// VIO_STREAM_TELEMETRY_DISTRIBUTED. Invalid core settings disable telemetry;
+// SILO_STREAM_TELEMETRY_DISTRIBUTED. Invalid core settings disable telemetry;
 // invalid distributed-only settings retain local telemetry.
 func ConfigFromEnv(nodeID string) Config {
 	cfg := DefaultConfig(nodeID)
-	cfg.Enabled = envutil.BoolDefaultNames(true, enabledEnv, enabledEnvLegacy)
+	cfg.Enabled = envutil.BoolDefault(enabledEnv, true)
 	coreInvalid := make([]string, 0)
 	distributedInvalid := make([]string, 0)
 	// The operator only owns the variables they actually set. The cross-checks
@@ -135,11 +119,10 @@ func ConfigFromEnv(nodeID string) Config {
 	// sizing knobs are ever cross-checked; ENABLED and DISTRIBUTED are never
 	// blamed by crossCheckFailed, so defaulting them on cannot misreport anyone.
 	explicit := make(map[string]bool)
-	cfg.Distributed = envutil.BoolNames(distributedEnv, distributedEnvLegacy)
-	cfg.DistributedExplicit = envutil.IsSet(distributedEnv) || envutil.IsSet(distributedEnvLegacy)
-	parseDuration := func(names []string, dst *time.Duration) {
-		name := names[0]
-		value := strings.TrimSpace(envutil.GetenvFirst(names...))
+	cfg.Distributed = envutil.Bool(distributedEnv)
+	cfg.DistributedExplicit = envutil.IsSet(distributedEnv)
+	parseDuration := func(name string, dst *time.Duration) {
+		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
 			return
 		}
@@ -151,9 +134,8 @@ func ConfigFromEnv(nodeID string) Config {
 		}
 		*dst = parsed
 	}
-	parseDistributedDuration := func(names []string, dst *time.Duration) {
-		name := names[0]
-		value := strings.TrimSpace(envutil.GetenvFirst(names...))
+	parseDistributedDuration := func(name string, dst *time.Duration) {
+		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
 			return
 		}
@@ -165,9 +147,8 @@ func ConfigFromEnv(nodeID string) Config {
 		}
 		*dst = parsed
 	}
-	parsePositive := func(names []string, dst *int64) {
-		name := names[0]
-		value := strings.TrimSpace(envutil.GetenvFirst(names...))
+	parsePositive := func(name string, dst *int64) {
+		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
 			return
 		}
@@ -178,9 +159,8 @@ func ConfigFromEnv(nodeID string) Config {
 		}
 		*dst = parsed
 	}
-	parseDistributedPositive := func(names []string, dst *int) {
-		name := names[0]
-		value := strings.TrimSpace(envutil.GetenvFirst(names...))
+	parseDistributedPositive := func(name string, dst *int) {
+		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
 			return
 		}
@@ -191,26 +171,26 @@ func ConfigFromEnv(nodeID string) Config {
 		}
 		*dst = parsed
 	}
-	parseDuration([]string{sweepIntervalEnv, sweepIntervalEnvOld}, &cfg.SweepInterval)
-	parseDuration([]string{retentionEnv, retentionEnvLegacy}, &cfg.Retention)
-	parsePositive([]string{maxSessionsEnv, maxSessionsEnvLegacy}, &cfg.MaxSessions)
-	parsePositive([]string{maxTransfersEnv, maxTransfersEnvLegacy}, &cfg.MaxTransfers)
-	parsePositive([]string{maxObservationsEnv, maxObservationsOld}, &cfg.MaxObservations)
-	parseDistributedDuration([]string{freshnessEnv, freshnessEnvLegacy}, &cfg.Freshness)
-	parseDistributedDuration([]string{membershipTTLEnv, membershipTTLLegacy}, &cfg.MembershipTTL)
-	parseDistributedDuration([]string{viewTTLEnv, viewTTLEnvLegacy}, &cfg.ViewTTL)
-	parseDistributedPositive([]string{fullResyncEveryEnv, fullResyncEveryOld}, &cfg.FullResyncEvery)
-	parseDistributedPositive([]string{maxPublishersEnv, maxPublishersOld}, &cfg.MaxPublishers)
-	parseDistributedPositive([]string{maxMergedSessionsEnv, maxMergedSessionsOld}, &cfg.MaxMergedSessions)
-	parseDistributedPositive([]string{maxMergedTransfersEnv, maxMergedTransfersOld}, &cfg.MaxMergedTransfers)
-	if value := strings.TrimSpace(envutil.GetenvFirst(familiesEnv, familiesEnvLegacy)); value != "" {
+	parseDuration(sweepIntervalEnv, &cfg.SweepInterval)
+	parseDuration(retentionEnv, &cfg.Retention)
+	parsePositive(maxSessionsEnv, &cfg.MaxSessions)
+	parsePositive(maxTransfersEnv, &cfg.MaxTransfers)
+	parsePositive(maxObservationsEnv, &cfg.MaxObservations)
+	parseDistributedDuration(freshnessEnv, &cfg.Freshness)
+	parseDistributedDuration(membershipTTLEnv, &cfg.MembershipTTL)
+	parseDistributedDuration(viewTTLEnv, &cfg.ViewTTL)
+	parseDistributedPositive(fullResyncEveryEnv, &cfg.FullResyncEvery)
+	parseDistributedPositive(maxPublishersEnv, &cfg.MaxPublishers)
+	parseDistributedPositive(maxMergedSessionsEnv, &cfg.MaxMergedSessions)
+	parseDistributedPositive(maxMergedTransfersEnv, &cfg.MaxMergedTransfers)
+	if value := strings.TrimSpace(os.Getenv(familiesEnv)); value != "" {
 		if families, ok := parseFamilies(value); ok {
 			cfg.Families = families
 		} else {
 			coreInvalid = append(coreInvalid, familiesEnv)
 		}
 	}
-	if value := envutil.GetenvFirst(keyPrefixEnv, keyPrefixEnvLegacy); value != "" {
+	if value := os.Getenv(keyPrefixEnv); value != "" {
 		if strings.TrimSpace(value) == "" || strings.IndexFunc(value, unicode.IsSpace) >= 0 {
 			distributedInvalid = append(distributedInvalid, keyPrefixEnv)
 		} else {

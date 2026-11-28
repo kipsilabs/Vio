@@ -143,7 +143,7 @@ func TestFetchPackageResourceAllowsSlowProgressingBody(t *testing.T) {
 		for range chunks {
 			_, _ = w.Write([]byte("x"))
 			w.(http.Flusher).Flush()
-			time.Sleep(gap) //nolint:forbidigo // Streams a slow response; the gaps are the timing scenario under test.
+			time.Sleep(gap) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 		}
 	})
 	client := newPackageFetchClient(shortPackageFetchTimeouts)
@@ -221,7 +221,7 @@ func TestFetchPackageResourceAllowsSlowSingleChunkBody(t *testing.T) {
 			if _, err := conn.Write(data); err != nil {
 				return
 			}
-			time.Sleep(gap) //nolint:forbidigo // Streams a slow chunked upload; the gaps are the timing scenario under test.
+			time.Sleep(gap) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 		}
 		_, _ = io.WriteString(conn, "\r\n0\r\n\r\n")
 	}()

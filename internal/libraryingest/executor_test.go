@@ -211,7 +211,7 @@ func (s *finalizeRecordingScanner) FinalizeVariantsByPathPrefix(context.Context,
 
 // TestIngestFolderLetsActiveDrainerBatchFinishAfterSettleWindow is a regression
 // test for the settle-window cancellation bug: a TV library full scan was
-// recorded as "canceled" because stopDrainers canceled a drainer batch that
+// recorded with the terminal status because stopDrainers canceled a drainer batch that
 // was already in flight. The active batch must be allowed to finish; otherwise
 // rows it already claimed can be excluded from the final scoped matcher by the
 // runStartedAt attempt window.

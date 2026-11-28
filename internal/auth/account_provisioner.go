@@ -58,9 +58,9 @@ func (p *AccountProvisioner) CreateAccount(
 	if err := p.createDefaultProfile(ctx, user.ID, input); err != nil {
 		if deleteErr := p.users.Delete(ctx, user.ID); deleteErr != nil {
 			return nil, fmt.Errorf(
-				"create default profile: %w (cleanup user: %w)",
+				"create default profile: %w (cleanup user: %v)",
 				err,
-				deleteErr,
+				deleteErr, //nolint:errorlint // callers classify the profile error; the cleanup failure is only reported
 			)
 		}
 		return nil, fmt.Errorf("create default profile: %w", err)

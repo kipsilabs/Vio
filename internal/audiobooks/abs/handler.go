@@ -390,6 +390,10 @@ type Dependencies struct {
 	// NativeSessionSyncer flushes native session-manager state into the shared
 	// admin live-session table after ABS play/sync/close events.
 	NativeSessionSyncer PlaybackSessionSyncer
+	// DemoSettings and AccountIsAdmin decide sign-out in demo mode
+	// (demoRestricted); a nil DemoSettings means demo mode cannot be on.
+	DemoSettings   DemoSettingsReader
+	AccountIsAdmin func(ctx context.Context, userID string) (bool, error)
 	// CoverResolver translates a raw silo poster path (e.g.
 	// "local/audiobooks/.../original.webp") into a fully-qualified URL
 	// the ABS client can fetch. Optional; when nil, /api/items/{id}/cover
@@ -422,8 +426,6 @@ func (h *Handler) SetDownloads(d Downloads) {
 
 // SkipMediaCompression reports whether an ABS media route must retain the
 // server's original ResponseWriter for sendfile and optional interface support.
-//
-//nolint:gocyclo // The compression-skip decision tree mirrors the ABS protocol.
 func SkipMediaCompression(r *http.Request) bool {
 	const (
 		apiSegment      = "api"

@@ -253,6 +253,11 @@ func NewService(
 		archiveCache:  archiveCache,
 		host:          host,
 	}
+	if svc.archiveCache != nil && installations != nil && catalog != nil && installer != nil {
+		// A server on another platform than the one that installed a
+		// plugin fetches its own platform's build of it.
+		svc.archiveCache.platforms = &platformArchives{store: installations, fetch: svc.fetchPlatformBuild}
+	}
 	// Resident plugins (network access providers) are reconciled after every
 	// lifecycle change; the supervisor stays inert until StartResidents arms
 	// it once the API listener is bound.
@@ -310,7 +315,7 @@ func catalogEntryPreferredForDiscovery(candidate, current CatalogEntry) bool {
 
 func repositorySourcePrecedence(sourceKind string) int {
 	switch sourceKind {
-	case RepositorySourceSilo, "silo":
+	case RepositorySourceSilo:
 		return 0
 	case RepositorySourceApprovedCommunity:
 		return 1
@@ -471,8 +476,12 @@ func (s *Service) UpdateToAvailableVersion(ctx context.Context, installationID i
 	if err != nil {
 		return nil, err
 	}
-	if installation.AvailableVersion == nil || *installation.AvailableVersion == "" {
-		return nil, fmt.Errorf("no update available for plugin %q", installation.PluginID)
+	// A recorded version that isn't newer than the installed one is a stale
+	// offer, such as one recorded after an admin installed a newer release:
+	// installing it would downgrade the plugin (#4518).
+	if installation.AvailableVersion == nil || *installation.AvailableVersion == "" ||
+		compareVersions(*installation.AvailableVersion, installation.Version) <= 0 {
+		return nil, fmt.Errorf("%w %q", ErrNoUpdateAvailable, installation.PluginID)
 	}
 
 	targetVersion := *installation.AvailableVersion
@@ -490,14 +499,9 @@ func (s *Service) UpdateToAvailableVersion(ctx context.Context, installationID i
 		return nil, fmt.Errorf("update plugin %q to %s: %w", installation.PluginID, targetVersion, err)
 	}
 
-	// Clear available_version now that we've updated.
-	empty := ""
-	if err := s.installations.Update(ctx, installationID, UpdateInstallationInput{
-		AvailableVersion: &empty,
-	}); err != nil {
-		slog.WarnContext(ctx, "failed to clear available_version after update", "component", "plugins",
-			"installation_id", installationID, "error", err)
-	}
+	// The replacement cleared available_version in its own transaction. A
+	// second clear here would erase a newer release an update check recorded
+	// since (#4518).
 
 	// Reload and return the updated installation.
 	return s.installations.GetByID(ctx, installationID)
@@ -637,7 +641,11 @@ func (s *Service) PreloadEnabled(ctx context.Context) error {
 		if installation.IsBuiltin() {
 			continue
 		}
-		if _, err := s.ensureLoadedInstallation(ctx, installation); err != nil {
+		// A manifest read rehydrates and hashes the files as a launch does,
+		// but doesn't fetch this platform's build of a plugin stored for
+		// another platform: preload runs before the API listens, so a slow or
+		// unreachable catalog must not hold startup. The first launch fetches.
+		if _, err := s.ReadInstalledManifest(ctx, installation); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
@@ -834,6 +842,34 @@ func (s *Service) Stop(installationID int) error {
 	lock.Lock()
 	defer lock.Unlock()
 	return s.stopRuntime(installationID)
+}
+
+// StopUnlessEnabled stops installation id's process after a change that
+// disabled or removed it committed. It keeps the process only when the row,
+// read again under the runtime lock, is read and enabled: an enable that
+// committed and launched in between is newer than the change that asked for
+// the stop. Every launch takes the same lock, so none can slip between the
+// read and the stop. A row that is gone is stopped, and so is one that could
+// not be read: a disabled or removed plugin left answering is worse than an
+// enabled one briefly down, which its next call or reconcile starts again.
+// The read's error is returned after the stop, for the caller to log.
+func (s *Service) StopUnlessEnabled(ctx context.Context, installationID int) error {
+	lock := s.runtimeLock(installationID)
+	lock.Lock()
+	defer lock.Unlock()
+	installation, err := s.installations.GetByID(ctx, installationID)
+	if err == nil && installation.Enabled {
+		return nil
+	}
+	stopErr := s.stopRuntime(installationID)
+	if err != nil && !errors.Is(err, ErrInstallationNotFound) {
+		// A plugin that was not running is no failure; the read still is.
+		if stopErr != nil && !errors.Is(stopErr, pluginhost.ErrClientNotFound) {
+			return errors.Join(err, stopErr)
+		}
+		return err
+	}
+	return stopErr
 }
 
 // stopRuntime stops a process with its lock held.

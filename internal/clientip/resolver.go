@@ -197,14 +197,13 @@ func (r *Resolver) ReloadTrustedCIDRs(ctx context.Context, store SettingsStore) 
 	return nil
 }
 
-// WebSocket upgrades name the same transport security as their HTTP
-// counterparts: Traefik sends "wss"/"ws" instead of "https"/"http", accepted
-// there only.
+// Forwarded protocols Traefik sends on a WebSocket upgrade in place of
+// http and https.
 const (
-	schemeHTTP  = "http"
-	schemeHTTPS = "https"
-	schemeWS    = "ws"
-	schemeWSS   = "wss"
+	forwardedProtoWS  = "ws"
+	forwardedProtoWSS = "wss"
+	schemeHTTP        = "http"
+	schemeHTTPS       = "https"
 )
 
 // requestScheme must run before Middleware replaces the transport peer address.
@@ -212,11 +211,6 @@ const (
 // and overwrite X-Forwarded-Proto, never append it.
 // On a WebSocket upgrade, Traefik sends "wss" or "ws" instead of "https" or
 // "http"; those name the same transport security and are accepted there only.
-//
-// websocketSchemeToHTTPScheme maps a WebSocket forwarded-proto value to the
-// HTTP scheme naming the same transport security.
-var websocketSchemeToHTTPScheme = map[string]string{schemeWS: schemeHTTP, schemeWSS: schemeHTTPS}
-
 func (r *Resolver) requestScheme(req *http.Request) string {
 	scheme := schemeHTTP
 	if req.TLS != nil {
@@ -235,9 +229,13 @@ func (r *Resolver) requestScheme(req *http.Request) string {
 	switch values[0] {
 	case schemeHTTP, schemeHTTPS:
 		return values[0]
-	case schemeWS, schemeWSS:
+	case forwardedProtoWS:
 		if isWebSocketUpgrade(req) {
-			return websocketSchemeToHTTPScheme[values[0]]
+			return schemeHTTP
+		}
+	case forwardedProtoWSS:
+		if isWebSocketUpgrade(req) {
+			return schemeHTTPS
 		}
 	}
 	return ""

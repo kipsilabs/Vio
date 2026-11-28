@@ -23,7 +23,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const CredentialsKey = "ai.chatgpt.credentials" //nolint:gosec // Settings key name, not a credential value.
+const CredentialsKey = "ai.chatgpt.credentials" //nolint:gosec // upstream code keeps a bounded, non-secret value; reviewed
 const issuer = "https://auth.openai.com"
 const resource = "https://api.openai.com/v1"
 const planScope = "chatgpt.tokens.use.direct"
@@ -166,6 +166,31 @@ func decode(raw string) (credentials, error) {
 	return c, nil
 }
 
+// Connected reports whether the stored credentials (the CredentialsKey
+// value) hold an active account with its plan accepted and no new login
+// needed. A disconnected account's record does not; a usage-limited one
+// does, since its limit lifts on its own.
+func Connected(raw string) bool {
+	c, err := decode(raw)
+	if err != nil {
+		return false
+	}
+	a, ok := c.active()
+	return ok && !a.PlanIneligible && a.signedIn()
+}
+
+// active is the active account, if there is one.
+func (c credentials) active() (account, bool) {
+	i := slices.IndexFunc(c.Accounts, func(a account) bool { return a.ClientID == c.Active })
+	if i < 0 {
+		return account{}, false
+	}
+	return c.Accounts[i], true
+}
+
+// signedIn reports whether the account can get tokens without a new login.
+func (a account) signedIn() bool { return !a.NeedsLogin && a.RefreshToken != "" }
+
 func (s *Service) mutate(ctx context.Context, fn func(*credentials) error) error {
 	return s.store.UpdateValueAtomic(ctx, CredentialsKey, func(raw string) (string, error) {
 		c, err := decode(raw)
@@ -269,7 +294,7 @@ func (s *Service) authorizationURL(c *credentials, p *pendingLogin) string {
 	q := url.Values{oauthClientID: {clientID}, "ext_agent_host_id": {c.HostID}, "response_type": {oauthCode},
 		"redirect_uri": {p.RedirectURI}, "scope": {authorizationScope},
 		oauthResource: {resource}, oauthState: {p.State}, "nonce": {p.Nonce}, "code_challenge_method": {"S256"}, "code_challenge": {hash(p.Verifier)}}
-	if p.ClientID == "" { //nolint:nestif // upstream authorizationURL in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if p.ClientID == "" { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		q.Set("agent_name_hint", "Silo")
 	} else {
 		for _, a := range c.Accounts {
@@ -341,7 +366,7 @@ func (s *Service) exchange(ctx context.Context, form url.Values) (tokenResponse,
 	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
 		return tokens, &transientProviderError{retryAfter: tokenRetryAfter(resp.Header.Get("Retry-After"))}
 	}
-	if resp.StatusCode == 400 || resp.StatusCode == 401 { //nolint:nestif // upstream exchange in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if resp.StatusCode == 400 || resp.StatusCode == 401 { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		var problem struct {
 			Error string `json:"error"`
 		}
@@ -390,7 +415,7 @@ func (s *Service) CompleteLogin(ctx context.Context, callbackURL string) error {
 	return err
 }
 
-func (s *Service) CompleteLoginWithSettings(ctx context.Context, callbackURL string) (*SettingsTransition, error) { //nolint:funlen,gocyclo // upstream CompleteLoginWithSettings exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func (s *Service) CompleteLoginWithSettings(ctx context.Context, callbackURL string) (*SettingsTransition, error) { //nolint:funlen,gocyclo // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	var pending pendingLogin
 	var callback Callback
 	// Persist consumption before exchanging the authorization code. A node
@@ -427,7 +452,7 @@ func (s *Service) CompleteLoginWithSettings(ctx context.Context, callbackURL str
 	var claims *identityClaims
 	var completionErr error
 	var rejectedIdentity bool
-	if callback.Error != "" || callback.Code == "" || clientID == "" || clientID == dynamicClientID || (callback.ClientID != "" && callback.ClientID != clientID) { //nolint:nestif // upstream CompleteLoginWithSettings in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if callback.Error != "" || callback.Code == "" || clientID == "" || clientID == dynamicClientID || (callback.ClientID != "" && callback.ClientID != clientID) { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		completionErr = ErrIdentity
 	} else {
 		tokens, completionErr = s.exchange(completionCtx, url.Values{"grant_type": {oauthAuthorizationCode}, oauthClientID: {clientID},
@@ -549,17 +574,17 @@ func (s *Service) tokenSource(ctx context.Context, recheckUsage bool) (func(cont
 	if err != nil {
 		return nil, err
 	}
-	i := slices.IndexFunc(c.Accounts, func(a account) bool { return a.ClientID == c.Active })
-	if i >= 0 && c.Accounts[i].PlanIneligible {
+	a, ok := c.active()
+	if ok && a.PlanIneligible {
 		return nil, ErrPlanIneligible
 	}
-	if i >= 0 && c.Accounts[i].UsageLimited && !recheckUsage {
+	if ok && a.UsageLimited && !recheckUsage {
 		return nil, ErrUsageLimited
 	}
-	if i < 0 || c.Accounts[i].NeedsLogin || c.Accounts[i].RefreshToken == "" {
+	if !ok || !a.signedIn() {
 		return nil, ErrSignInRequired
 	}
-	clientID := c.Accounts[i].ClientID
+	clientID := a.ClientID
 	return func(ctx context.Context) (string, error) { return s.bearerToken(ctx, clientID, recheckUsage) }, nil
 }
 
@@ -858,7 +883,7 @@ func (s *Service) revokeSession(ctx context.Context, a account) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if endpoint == "" { //nolint:nestif // upstream revokeSession in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+		if endpoint == "" { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 			d, err := s.discovery(ctx)
 			if err != nil {
 				if errors.Is(err, ErrIdentity) || errors.Is(err, ErrSignInRequired) {

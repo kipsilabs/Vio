@@ -496,7 +496,6 @@ func (s *CatalogService) fetchRepositoryIndexLimited(ctx context.Context, reposi
 	if err != nil {
 		return nil, err
 	}
-
 	var index RepositoryIndex
 	if err := json.Unmarshal(data, &index); err != nil {
 		return nil, packageError(fmt.Errorf("decode repository index %q: %w", repositoryURL, err), "Silo couldn't read %s: it isn't a valid plugin catalog.", subject)

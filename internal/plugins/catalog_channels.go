@@ -10,7 +10,7 @@ const (
 	OfficialRepositoryManagedKey          = "official"
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
 
-	RepositorySourceSilo              = "vio"
+	RepositorySourceSilo              = "silo"
 	RepositorySourceApprovedCommunity = "approved_community"
 	RepositorySourceExternal          = "external"
 
@@ -50,10 +50,12 @@ func isApprovedCommunityPlugin(pluginID string) bool {
 	return ok
 }
 
-// First-party watch-provider plugin IDs the code names more than once.
+// First-party plugin IDs the code names more than once.
 const (
-	pluginIDSimkl = "silo.watchprovider.simkl"
-	pluginIDTrakt = "silo.watchprovider.trakt"
+	pluginIDTheIntroDB = "silo.theintrodb"
+	pluginIDTVDB       = "silo.tvdb"
+	pluginIDSimkl      = "silo.watchprovider.simkl"
+	pluginIDTrakt      = "silo.watchprovider.trakt"
 )
 
 // officialPluginRepositories binds each first-party plugin ID to the only

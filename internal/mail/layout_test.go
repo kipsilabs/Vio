@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/branding"
 )
 
 func TestRenderLayoutEscapesAndPlacesContent(t *testing.T) {
@@ -25,7 +27,7 @@ func TestRenderLayoutEscapesAndPlacesContent(t *testing.T) {
 	if !strings.Contains(out, `<span id="footer-marker">fine print</span>`) {
 		t.Fatalf("footer HTML not passed through:\n%s", out)
 	}
-	if !strings.Contains(out, `src="cid:silo-logo"`) || !strings.Contains(out, `alt="Vio"`) {
+	if !strings.Contains(out, `src="cid:silo-logo"`) || !strings.Contains(out, `alt="`+branding.DefaultServerName+`"`) {
 		t.Fatalf("default logo missing:\n%s", out)
 	}
 }

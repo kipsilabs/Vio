@@ -120,7 +120,7 @@ func (s *SocketTicketStore) Mint(ctx context.Context, identity SocketIdentity) (
 		if err != nil {
 			return "", err
 		}
-		ok, err := s.redis.SetArgs(ctx, "vio:events:v2:ticket:"+ticket, payload, redis.SetArgs{Mode: "NX", TTL: time.Until(identity.TicketExpiresAt)}).Result()
+		ok, err := s.redis.SetArgs(ctx, "silo:events:v2:ticket:"+ticket, payload, redis.SetArgs{Mode: "NX", TTL: time.Until(identity.TicketExpiresAt)}).Result()
 		if err != nil {
 			return "", err
 		}
@@ -154,7 +154,7 @@ func (s *SocketTicketStore) Consume(ctx context.Context, ticket string) (SocketI
 		return identity, ErrSocketTicket
 	}
 	if s.redis != nil {
-		data, err := s.redis.GetDel(ctx, "vio:events:v2:ticket:"+ticket).Bytes()
+		data, err := s.redis.GetDel(ctx, "silo:events:v2:ticket:"+ticket).Bytes()
 		if err != nil {
 			return identity, ErrSocketTicket
 		}

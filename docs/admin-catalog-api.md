@@ -69,9 +69,10 @@ episode has `series_id`, `series_title`, `season_number` and `episode_number`;
 its `year` is its air-date year.
 
 `poster_url` is the card-size poster of a movie or series, or of an episode's
-series, and is absent only when there is none. It is always a URL this server
-issued, never a metadata provider's, so a tool that cannot reach the
-providers' image hosts can load it; art not cached yet comes through a signed
+series, and is absent only when there is none. It is always a path on this
+server, never a metadata provider's or the artwork store's URL, so a tool that
+may contact only this server can load it: cached art comes through a signed
+`/api/v2/artwork/...` path and art not cached yet through a signed
 `getItemPoster` link (see "Admin poster URLs" in [images-api.md](images-api.md)).
 The URL expires: read it again from a later page rather than storing it.
 
@@ -200,6 +201,13 @@ The worker later opens the local path, downloads the remote URL, or reads the
 storage object. Source bytes are not frozen at submission. Local paths must be
 available on the worker that claims the job; remote content may change between
 submission and execution.
+
+An import job names its source in `source_label`: the remote URL, the local
+file name, the artifact key's file name, or the English text `Export job <id>`.
+An import queued with `export_job_id` also returns that ID as
+`source_export_job_id`; clients that show the source should build their own
+label from it, since `source_label` is not translated. Imports queued before the
+server recorded that ID have only `source_label`.
 
 The publish operation requires a completed export artifact. It saves a signed URL
 with a seven-day signature lifetime and returns `job_id`, `url`, and `expires_at`.
@@ -391,6 +399,21 @@ favorites and progress refer to. An audiobook or ebook runs `complete` as
 clearing them would give the book a new content ID and leave its progress,
 favorites and provider IDs on the old one.
 
+The match can merge the rebuilt movie or series onto the existing item that
+holds one of its provider IDs, which keeps that item's content ID, files and
+history. That item's values may come from a match the admin has since removed,
+so a `complete` refresh of a movie or series ends like `reset` does: every
+unlocked field other than the title and artwork, the credits and the rating
+sources get the providers' values, empty when no provider has one. Unlike
+`reset`, it keeps `locked_fields` and the values they hold. It clears only the
+base row: the localization rows keep their text in other languages, including
+text the removed match wrote, and a library whose metadata language isn't the
+item's own keeps the base row's overview and tagline, as `reset` does. When a
+provider in the chain fails to answer (the failures that fail a reset, and also an
+enrichment provider whose key is rejected), it ends with a quick refresh instead
+and keeps the values the providers leave empty. A season
+or episode target ends with a quick refresh of that season or episode.
+
 `reset` is Reset to Provider: a quick refresh of the movie, series, season or
 episode that also removes its `locked_fields` and gives every lockable field,
 the credits and the rating sources the providers' values, empty when no
@@ -564,7 +587,8 @@ Each file reports `state`, `servable`, and `failures`, with optional
 `last_error`, `generated_at`, `thumbnail_count`, `thumbnail_width`, `interval_ms`,
 and `sheet_bytes`. `state` is `off` for a disabled library, a library with an
 unsupported type, or one with previews turned off; `unusable` for an ineligible
-file or a permanent sampling failure; otherwise it reflects `pending`,
+file or one whose sampling failed on the file's data several times in a
+row; otherwise it reflects `pending`,
 `running`, or `ready`. An eligible file with
 no queue row yet reports `pending`. `servable` independently reports whether
 the current store has a published revision matching the file: previous sheets
@@ -769,9 +793,6 @@ the provider list again; pagination bounds response size, not provider work or
 memory, and stores no server-side snapshot. Provider failures expose generic
 messages. The web drains all pages under one captured authority and refuses
 repeated or invalid continuation rather than publishing a partial list.
-`current` carries the stored selection: `poster_url`, `backdrop_url`, and
-`logo_url`, plus `still_url` for an episode, which is its title card. Every
-member is absent when the scope has no such artwork.
 
 For a movie or series the list also offers its local sidecar artwork (the
 `poster.jpg`, `fanart.jpg` and similar files a refresh would use), found by
@@ -792,19 +813,9 @@ upload that has since been replaced is not listed. See
 [Local NFO metadata](architecture/local-nfo-metadata.md#admin-image-picker).
 
 `POST /api/v2/admin/items/{id}/images/apply` accepts `original_url`, `type`, and
-optional `provider_id`. `type` is one of `poster`, `backdrop`, `logo`, `still`,
-or `titlecard`. `still` and `titlecard` are the same episode title card and are
-only accepted for an episode; a movie, series, or season is refused with `400
-unsupported_image_type` before any download, rather than silently stored as a
-poster. That refusal is an allowed bridge correctness fix: before `titlecard`
-resolved to the still, the shared resolver fell through to `poster` and stored
-the image as that scope's poster with no signal, and a silent wrong-type store
-was a bug rather than a contract. Every request that was valid before keeps its
-image type and result. An episode accepts any of these values only as its
-still, keeping the historical coercion of a `poster` sent for an episode. An
-HTTP(S) `original_url`
-may name a public or local-network address; link-local, cloud metadata and other
-blocked addresses are refused (see
+optional `provider_id`. An HTTP(S) `original_url` may name a public or
+local-network address; link-local, cloud metadata and other blocked addresses
+are refused (see
 [Outbound address guard](architecture/outbound-address-guard.md#artwork-downloads)). A `file://`
 `original_url` is accepted for a movie or series only when the item's sidecar
 discovery offers that file for that image type; anything else returns a `422`

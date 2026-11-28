@@ -358,7 +358,7 @@ func (s *Service) reconcileContinueWatching(ctx context.Context, userID int, pro
 // once the primary one matches.
 func (s *Service) seriesIDsByProviderIDs(ctx context.Context, series Record) ([]string, error) {
 	candidates := []struct{ column, value string }{
-		{columnTVDBID, series.TVDBID}, {columnTMDBID, series.TMDBID}, {columnImdbID, series.IMDbID},
+		{columnTVDB, series.TVDBID}, {columnTMDB, series.TMDBID}, {columnIMDb, series.IMDbID},
 	}
 	if series.PreferTMDB {
 		candidates[0], candidates[1] = candidates[1], candidates[0]

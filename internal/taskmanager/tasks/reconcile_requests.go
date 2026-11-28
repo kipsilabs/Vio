@@ -119,7 +119,7 @@ func NewReconcileRequestsTask(reconciler RequestReconciler, limit int, pool *pgx
 func (t *ReconcileRequestsTask) Key() string  { return "reconcile_requests" }
 func (t *ReconcileRequestsTask) Name() string { return "Reconcile Requests" }
 func (t *ReconcileRequestsTask) Description() string {
-	return "Checks approved and active media requests against Radarr, Sonarr, and the Vio catalog"
+	return "Checks approved and active media requests against Radarr, Sonarr, and the Silo catalog"
 }
 func (t *ReconcileRequestsTask) Category() taskmanager.TaskCategory {
 	return taskmanager.TaskCategoryLibrary

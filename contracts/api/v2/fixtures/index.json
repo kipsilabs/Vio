@@ -4955,7 +4955,7 @@
         "method": "POST",
         "path": "/api/v2/auth/oauth/complete",
         "headers": {
-          "Cookie": "vio_oauth_complete=browser-binding"
+          "Cookie": "silo_oauth_complete=browser-binding"
         },
         "body": "{\"code\":\"c0de\"}"
       },
@@ -14963,7 +14963,7 @@
       "response_headers": {
         "Cache-Control": "no-store",
         "Content-Type": "application/json",
-        "Set-Cookie": "vio_oauth_fixture=binder; Path=/api/v2/auth/oauth/3/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
+        "Set-Cookie": "silo_oauth_fixture=binder; Path=/api/v2/auth/oauth/3/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
       },
       "response_media_type": "application/json",
       "schema": "#/components/schemas/AccountIdentityLinkStart",

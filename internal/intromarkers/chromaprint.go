@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/mediasample"
@@ -47,12 +46,7 @@ func (e *ChromaprintExtractor) Preflight(ctx context.Context) error {
 }
 
 // Extract fingerprints the candidate's opening audio for intro detection.
-// Virtual sources have no local file to fingerprint; like the repository's
-// candidate query, extraction skips them before touching ffmpeg.
 func (e *ChromaprintExtractor) Extract(ctx context.Context, candidate Candidate) (Fingerprint, bool, error) {
-	if candidate.FilePath == "" || strings.HasPrefix(strings.ToLower(candidate.FilePath), "virtual://") {
-		return Fingerprint{}, false, nil
-	}
 	window := headWindow(candidate, e.config)
 	points, err := e.extractWindow(ctx, candidate, window)
 	if err != nil || len(points) == 0 {

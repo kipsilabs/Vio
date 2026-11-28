@@ -23,9 +23,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/database/queryattr"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/lang"
+	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/metadata/showstatus"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/naming"
+	"github.com/Silo-Server/silo-server/internal/pluginhost"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -76,8 +78,6 @@ type metadataItemRepo interface {
 	GetByExternalID(ctx context.Context, tmdbID, imdbID, tvdbID, itemType string) (*models.MediaItem, error)
 	GetByTitleYearType(ctx context.Context, title string, year int, itemType string) (*models.MediaItem, error)
 	Upsert(ctx context.Context, item *models.MediaItem) error
-	UpdateStatus(ctx context.Context, contentID, status string) error
-	UpdateEpisodeMetadataState(ctx context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) error
 	SetStatusUnlessMatched(ctx context.Context, contentID, status string) (bool, error)
 	UpdateProvisionalArtwork(ctx context.Context, read *models.MediaItem, upd *catalog.MetadataUpdate) (bool, error)
 	IncrementRefreshFailure(ctx context.Context, contentID string) error
@@ -242,6 +242,8 @@ type metadataEpisodeLocalizationRepo interface {
 // for looking up per-library settings like metadata language.
 type metadataFolderRepo interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
+	// ListByIDs returns the enabled folders among ids.
+	ListByIDs(ctx context.Context, ids []int) ([]*models.MediaFolder, error)
 }
 
 // metadataVideoRepo persists remote provider videos. The concrete
@@ -681,6 +683,11 @@ func (s *MetadataService) SetImageResolver(r interface {
 // Provider chains are determined by admin configuration and change rarely, so
 // caching avoids repeated DB queries when processing batches of files.
 func (s *MetadataService) resolveChainCached(ctx context.Context, folderID int, contentLevel string) ([]Provider, error) {
+	if folderID <= 0 {
+		if folderIDs := itemChainScopeFolders(ctx); len(folderIDs) > 0 {
+			return s.resolveLibrariesChain(ctx, folderIDs, contentLevel)
+		}
+	}
 	key := fmt.Sprintf("%d:%s", folderID, contentLevel)
 
 	s.chainCacheMu.RLock()
@@ -736,6 +743,10 @@ func (s *MetadataService) Process(ctx context.Context, req ProcessRequest) (*Pro
 	}
 
 	folderID := parseProcessFolderID(req.FolderID)
+	ctx, err = s.withItemChainScope(ctx, req.ContentID, folderID)
+	if err != nil {
+		return nil, err
+	}
 	languages, err := s.resolveProcessLanguages(ctx, req, folderID)
 	if err != nil {
 		return nil, err
@@ -1660,14 +1671,16 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 			selectionHints = &hintsCopy
 		}
 		searchQuery = suppressTitleYearFallbackForTrustedIDs(searchQuery)
-		searchProviders := func(query SearchQuery) []SearchResult {
+		searchProviders := func(query SearchQuery) ([]SearchResult, bool) {
 			resultsForQuery := make([]SearchResult, 0)
+			remoteTransientError := false
 			for _, p := range itemChain {
 				sp, ok := p.(SearchProvider)
 				if !ok {
 					continue
 				}
-				if _, local := p.(IdentityHintProvider); local && skipLocalProvider {
+				_, local := p.(IdentityHintProvider)
+				if local && skipLocalProvider {
 					continue
 				}
 				results, searchErr := sp.Search(ctx, query)
@@ -1677,6 +1690,9 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 					continue
 				}
 				if searchErr != nil {
+					if !local && hasTransientMatchError([]error{searchErr}) {
+						remoteTransientError = true
+					}
 					if handleProvider404(provider404s, accumulatedIDs, p.Slug(), searchErr,
 						"title", query.Title,
 						"year", query.Year,
@@ -1707,16 +1723,16 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 					}
 					resultsForQuery = append(resultsForQuery, result)
 				}
-				if _, local := p.(IdentityHintProvider); !local {
+				if !local {
 					for _, r := range results {
 						nfoVerifiedIDs = recordVerifiedIDs(nfoVerifiedIDs, r.ProviderIDs, nfoHintIDs)
 					}
 				}
 			}
-			return resultsForQuery
+			return resultsForQuery, remoteTransientError
 		}
 
-		allResults := searchProviders(searchQuery)
+		allResults, remoteTransientErr := searchProviders(searchQuery)
 		// A dead NFO identity leaves the tag ids alone: when a provider
 		// rejected every id the NFO named, search again with the ids it
 		// replaced, less any the providers just rejected. Clearing the NFO's
@@ -1733,7 +1749,7 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 				}
 			}
 			nfoReplacedTagIDs, nfoHintIDs, nfoVerifiedIDs = nil, nil, nil
-			allResults = searchProviders(searchQuery)
+			allResults, remoteTransientErr = searchProviders(searchQuery)
 		}
 
 		candidates := NormalizeCandidatesForLanguage(allResults, contentType, searchQuery.Language)
@@ -1747,8 +1763,13 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 		for _, p := range itemChain {
 			providerPriority = append(providerPriority, p.Slug())
 		}
-		trySelection := func(hints *MatchHints, selectionCandidates []MatchCandidate) (*MatchCandidate, bool) {
+		trySelection := func(hints *MatchHints, selectionCandidates []MatchCandidate, partialRemoteSearch bool) (*MatchCandidate, bool) {
 			selected, ok := selectInitialMatchCandidate(hints, selectionCandidates, providerPriority)
+			// A lone-result match assumes no other configured provider has rivals;
+			// retry instead of persisting when a remote provider failed transiently.
+			if ok && partialRemoteSearch && slices.Contains(selected.MatchReasons, "sole_exact_title") {
+				return nil, false
+			}
 			if ok {
 				return selected, true
 			}
@@ -1766,7 +1787,7 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 			candidates []MatchCandidate
 		}
 		aliasAttempts := []aliasAttempt{{selectionHints, candidates}}
-		winner, matched := trySelection(selectionHints, candidates)
+		winner, matched := trySelection(selectionHints, candidates, remoteTransientErr)
 		// Structured IDs remain decisive and never fall back to a title search.
 		// For title/year identities, try independently parsed path hypotheses only
 		// after the primary identity fails. Each attempt is bounded and scored
@@ -1787,13 +1808,14 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 				alternateQuery := searchQuery
 				alternateQuery.Title = alternate.Title
 				alternateQuery.Year = alternate.Year
-				alternateResults := searchProviders(alternateQuery)
+				alternateResults, alternateRemoteTransientErr := searchProviders(alternateQuery)
+				remoteTransientErr = remoteTransientErr || alternateRemoteTransientErr
 				alternateCandidates := NormalizeCandidatesForLanguage(alternateResults, contentType, alternateQuery.Language)
 				if len(alternateCandidates) == 0 {
 					continue
 				}
 				aliasAttempts = append(aliasAttempts, aliasAttempt{&alternateHints, alternateCandidates})
-				alternateWinner, alternateMatched := trySelection(&alternateHints, alternateCandidates)
+				alternateWinner, alternateMatched := trySelection(&alternateHints, alternateCandidates, remoteTransientErr)
 				if len(candidates) == 0 || alternateMatched || bestCandidateScore(&alternateHints, alternateCandidates) > bestCandidateScore(effectiveHints, candidates) {
 					candidates = alternateCandidates
 					effectiveHints = &alternateHints
@@ -1981,7 +2003,7 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 			if searchErr != nil {
 				// A provider whose search failed may never get the ID it
 				// answers metadata by, so it fails a reset like a failed lookup.
-				if failure := resetProviderFailure(req.resetToProvider, p, "search", searchErr); failure != nil {
+				if failure := req.unansweredLookup(p, "search", searchErr); failure != nil {
 					return nil, failure
 				}
 				if handleProvider404(provider404s, accumulatedIDs, p.Slug(), searchErr,
@@ -2089,7 +2111,7 @@ func (s *MetadataService) processInternal(ctx context.Context, req ProcessReques
 			localMetadataUnreadable |= localArtworkItem
 		}
 		if err != nil {
-			if failure := resetProviderFailure(req.resetToProvider, p, "metadata", err); failure != nil {
+			if failure := req.unansweredLookup(p, "metadata", err); failure != nil {
 				return nil, failure
 			}
 			if handleProvider404(provider404s, accumulatedIDs, p.Slug(), err,
@@ -2542,6 +2564,9 @@ func hasTransientMatchError(errs []error) bool {
 		if err == nil || errors.Is(err, ErrLocalMetadataUnavailable) {
 			continue // classified above, not by its message
 		}
+		if errors.Is(err, pluginhost.ErrPluginUnhealthy) {
+			return true
+		}
 		switch status.Code(err) {
 		case codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted, codes.Unavailable:
 			return true
@@ -2820,9 +2845,12 @@ func (s *MetadataService) mergeAndPersist(
 	// it doesn't follow a merge onto another row, whose edits and locks are
 	// that row's own: the merged row gets an ordinary refresh.
 	resetsRow := req.resetToProvider
+	// The refresh that ends a Complete Refresh empties the row's stored values
+	// the same way, keeping its locks, and doesn't follow a merge either.
+	rebuildsRow := req.rebuildMatch
 	// Identity repairs (rebinding, local-ID promotion) belong to matching and
 	// refreshes, never to an enrichment write.
-	if !req.writesFieldsOnly() && !isNew && contentID != "" && existingItem != nil && (isProvisionalOwnershipStatus(existingItem.Status) || len(durableIDs) == 0) { //nolint:nestif // upstream mergeAndPersist in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if !req.writesFieldsOnly() && !isNew && contentID != "" && existingItem != nil && (isProvisionalOwnershipStatus(existingItem.Status) || len(durableIDs) == 0) { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		reboundTo, err := s.rebindItemByProviderIDsLocked(ctx, contentID, accumulator.ProviderIDs, contentType, len(durableIDs) == 0, req.Mode == ModeIdentify)
 		if err != nil {
 			return nil, err
@@ -2831,6 +2859,7 @@ func (s *MetadataService) mergeAndPersist(
 			contentID = reboundTo
 			replacesShow = false
 			resetsRow = false
+			rebuildsRow = false
 			existingItem, err = s.itemRepo.GetByID(ctx, contentID)
 			if err != nil {
 				return nil, fmt.Errorf("loading rebound item: %w", err)
@@ -2849,7 +2878,7 @@ func (s *MetadataService) mergeAndPersist(
 	// be claimed underneath us; movies and first-match series move a handful of
 	// rows. Placed before the durableIDs merge below so the canonical row's
 	// provider IDs are folded into the accumulator. See canonicalizeLocalContentID.
-	if !req.writesFieldsOnly() && !isNew && contentid.IsLocal(contentID) { //nolint:nestif // upstream mergeAndPersist in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if !req.writesFieldsOnly() && !isNew && contentid.IsLocal(contentID) { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		canonical, renamed, err := s.canonicalizeLocalContentID(
 			ctx, contentID, providerIDsStruct(accumulator.ProviderIDs), contentType, req.Mode == ModeIdentify)
 		if err != nil {
@@ -2859,6 +2888,7 @@ func (s *MetadataService) mergeAndPersist(
 			contentID = canonical
 			replacesShow = replacesShow && renamed
 			resetsRow = resetsRow && renamed
+			rebuildsRow = rebuildsRow && renamed
 			existingItem, err = s.itemRepo.GetByID(ctx, contentID)
 			if err != nil {
 				return nil, fmt.Errorf("loading canonicalized item: %w", err)
@@ -2889,6 +2919,7 @@ func (s *MetadataService) mergeAndPersist(
 			contentID = reanchored
 			replacesShow = replacesShow && renamed
 			resetsRow = resetsRow && renamed
+			rebuildsRow = rebuildsRow && renamed
 			existingItem, err = s.itemRepo.GetByID(ctx, contentID)
 			if err != nil {
 				return nil, fmt.Errorf("loading reanchored item: %w", err)
@@ -2950,7 +2981,7 @@ func (s *MetadataService) mergeAndPersist(
 		// Fallback text belongs to the provider IDs it was fetched with, so it
 		// applies after persistence moved the item to another content ID too.
 		keepStoredTitle := req.Mode != ModeInitialMatch || existingItem == nil || !isSkeletonLikeStatus(existingItem.Status)
-		if corrected || resetsRow {
+		if corrected || resetsRow || rebuildsRow {
 			req.fallback.ignoreStoredText()
 		}
 		req.fallback.applyToItem(accumulator, req.Language, existingItem, keepStoredTitle)
@@ -3022,10 +3053,16 @@ func (s *MetadataService) mergeAndPersist(
 					"content_id", contentID, "error", creditsErr)
 			}
 		}
+		// Episode labels belong to whichever provider the series is matched
+		// to. An Identify picks that provider anew, even when no trusted ID
+		// differs (a Sportarr league has none), so only its answer counts.
+		if req.Mode == ModeIdentify {
+			existingResult.EpisodeLabels = ""
+		}
 		// A correction's stored values describe another title, and a reset's
-		// are what the admin asked to replace: either way a value the
-		// providers lack must not stay behind.
-		if corrected || resetsRow {
+		// or a Complete Refresh's are what the admin asked to replace: either
+		// way a value the providers lack must not stay behind.
+		if corrected || resetsRow || rebuildsRow {
 			sortTitle, overview, tagline := existingResult.SortTitle, existingResult.Overview, existingResult.Tagline
 			clearPreviousMatch(existingResult, mergeLocked)
 			// A reset in another language fetched that language's text for
@@ -3182,7 +3219,7 @@ func (s *MetadataService) mergeAndPersist(
 			identityChosen:  req.Mode == ModeIdentify,
 			clearChildEdits: replacesShow,
 			resetLocks:      resetsRow,
-			clearCredits:    resetsRow && creditsUnlisted(item, mergeLocked),
+			clearCredits:    (resetsRow || rebuildsRow) && creditsUnlisted(item, mergeLocked),
 			clearWorkClaims: clearsWorkClaims,
 			workClaims:      accumulator.WorkClaims,
 		},
@@ -3233,7 +3270,7 @@ func (s *MetadataService) mergeAndPersist(
 	// so an enrichment write, which hears from one provider, leaves it alone.
 	// A local re-apply whose files list no people (artwork only, or an NFO
 	// without credits) leaves the stored cast as it is.
-	if !req.enrichmentOnly && (!req.localReapply || providersListPeople) && len(item.People) > 0 && s.personRepo != nil { //nolint:nestif // upstream mergeAndPersist in service.go exceeds Vio's nestif complexity-4 limit; refactor tracked separately
+	if !req.enrichmentOnly && (!req.localReapply || providersListPeople) && len(item.People) > 0 && s.personRepo != nil { //nolint:nestif // upstream branch nesting exceeds Vio's limit; refactor tracked separately
 		persons := make([]models.Person, len(item.People))
 		for i := range item.People {
 			persons[i] = item.People[i].Person
@@ -3312,7 +3349,7 @@ func (s *MetadataService) mergeAndPersist(
 		replace := mergeMode == MergeReplaceUnlocked || (req.Mode == ModeScheduledRefresh && !req.enrichmentOnly)
 		var err error
 		switch {
-		case req.Mode == ModeIdentify || corrected || resetsRow:
+		case req.Mode == ModeIdentify || corrected || resetsRow || rebuildsRow:
 			err = s.ratingSourceRepo.Replace(ctx, contentID, sources)
 		case len(sources) > 0:
 			err = s.ratingSourceRepo.Upsert(ctx, contentID, sources, replace)
@@ -3615,12 +3652,26 @@ func (s *MetadataService) RefreshItem(ctx context.Context, contentID string) err
 }
 
 func (s *MetadataService) refreshItemTarget(ctx context.Context, contentID string, folderID int, mode RefreshMode, incrementDebtAttempt, reset bool) error {
-	result, err := s.Process(ctx, ProcessRequest{
+	return s.refreshItem(ctx, ProcessRequest{
 		ContentID:       contentID,
 		FolderID:        formatFolderID(folderID),
 		Mode:            mode,
 		resetToProvider: reset,
-	})
+	}, incrementDebtAttempt)
+}
+
+func (s *MetadataService) refreshItem(ctx context.Context, req ProcessRequest, incrementDebtAttempt bool) error {
+	contentID, reset := req.ContentID, req.resetToProvider
+	result, err := s.Process(ctx, req)
+	if req.rebuildMatch && errors.As(err, new(unansweredLookupError)) {
+		// The item keeps the values that provider would have confirmed or
+		// replaced; an ordinary refresh still applies what the others sent.
+		slog.WarnContext(ctx, "metadata: a provider did not answer, so the complete refresh keeps stored values",
+			"component", "metadata", "content_id", contentID,
+			"error", logredact.RedactSecretAssignments(logredact.SanitizeURLError(err).Error()))
+		req.rebuildMatch = false
+		result, err = s.Process(ctx, req)
+	}
 	if err != nil {
 		s.recordRefreshFailure(ctx, contentID, err, incrementDebtAttempt)
 		return err
@@ -4272,21 +4323,10 @@ func (s *MetadataService) runOnDemandMetadataRefresh(targetType, contentID strin
 			"content_id", contentID)
 		err := s.refreshTarget(ctx, targetType, contentID, 0, ModeScheduledRefresh, false, false)
 		if err != nil {
-			if LocalMetadataUnavailableForVirtual(err) {
-				// A virtual provider source has no local files, so every NFO read
-				// for it fails by construction. That is the expected answer, not
-				// a mount or permission problem worth paging on; the local-file
-				// case below keeps its warning.
-				slog.Debug("metadata: on-demand stale refresh skipped: virtual source has no local metadata",
-					"target_type", targetType,
-					"content_id", contentID,
-					"error", err)
-			} else {
-				slog.Warn("metadata: on-demand stale refresh failed",
-					"target_type", targetType,
-					"content_id", contentID,
-					"error", err)
-			}
+			slog.Warn("metadata: on-demand stale refresh failed",
+				"target_type", targetType,
+				"content_id", contentID,
+				"error", err)
 		} else {
 			slog.Info("metadata: completed on-demand stale refresh",
 				"target_type", targetType,
@@ -4767,6 +4807,10 @@ func (s *MetadataService) refreshSeriesChildTarget(
 	} else if ignored {
 		return ErrMetadataNotFound
 	}
+	ctx, err = s.withItemChainScope(ctx, seriesID, folderID)
+	if err != nil {
+		return err
+	}
 
 	languages, err := s.resolveProcessLanguages(ctx, ProcessRequest{
 		ContentID: seriesID,
@@ -5015,7 +5059,7 @@ func (s *MetadataService) fetchTargetSeasonResults(ctx context.Context, provider
 			searched |= localArtworkSeason
 		}
 		for _, season := range seasons {
-			if seasonNumber >= 0 && season.SeasonNumber != seasonNumber {
+			if season.SeasonNumber != seasonNumber {
 				continue
 			}
 			accumulateSeasonResults(seasonResults, []SeasonResult{season}, language)
@@ -6760,14 +6804,6 @@ func (s *MetadataService) syncSeriesEpisodeState(ctx context.Context, seriesID s
 		slog.WarnContext(ctx, "metadata: failed to ensure series episode links", "component", "metadata",
 			"series_id", seriesID, "error", err)
 	}
-	if materializer, ok := s.itemRepo.(interface {
-		MaterializeVirtualPlaybackEpisodes(context.Context, string) error
-	}); ok {
-		if err := materializer.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {
-			slog.WarnContext(ctx, "metadata: failed to materialize released virtual episodes",
-				"component", "metadata", "series_id", seriesID, "error", err)
-		}
-	}
 	s.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now())
 }
 
@@ -6886,7 +6922,6 @@ func (s *MetadataService) synthesizeFallbackSeriesStructure(ctx context.Context,
 	return nil
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) linkSeriesFilesToEpisodes(ctx context.Context, seriesID string) {
 	if err := s.linkSeriesFilesToEpisodesWithOptions(ctx, seriesID, false); err == nil {
 		s.refreshSeriesEpisodeMetadataState(ctx, seriesID, time.Now())
@@ -7324,10 +7359,16 @@ type episodeLinkHint struct {
 }
 
 func (s *MetadataService) updateEpisodeMetadataState(ctx context.Context, seriesID string, incomplete bool, lastCheckedAt *time.Time) {
-	if s == nil || s.itemRepo == nil || seriesID == "" {
+	item, err := s.itemRepo.GetByID(ctx, seriesID)
+	if err != nil {
+		slog.WarnContext(ctx, "metadata: failed to load series item for episode metadata state", "component", "metadata",
+			"series_id", seriesID, "error", err)
 		return
 	}
-	if err := s.itemRepo.UpdateEpisodeMetadataState(ctx, seriesID, incomplete, lastCheckedAt); err != nil {
+
+	item.EpisodeMetadataIncomplete = incomplete
+	item.EpisodeMetadataLastCheckedAt = lastCheckedAt
+	if err := s.itemRepo.Upsert(ctx, item); err != nil {
 		slog.WarnContext(ctx, "metadata: failed to update episode metadata state", "component", "metadata",
 			"series_id", seriesID, "error", err)
 	}
@@ -8784,7 +8825,6 @@ func (s *MetadataService) confirmedOwnershipItem(ctx context.Context, contentID 
 	return item, true
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonByProviderIDs(
 	ctx context.Context,
 	skeletonContentID string,
@@ -8799,7 +8839,6 @@ func (s *MetadataService) rebindSkeletonByProviderIDs(
 	return s.rebindSkeletonByProviderIDsLocked(ctx, skeletonContentID, providerIDs, itemType)
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonByProviderIDsLocked(
 	ctx context.Context,
 	skeletonContentID string,
@@ -8934,7 +8973,6 @@ func (s *MetadataService) recoverProviderIDConflictWith(
 	return s.rebindItemByProviderIDsLocked(ctx, sourceContentID, providerIDs, itemType, allowMatchedSource, markIdentity)
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *MetadataService) rebindSkeletonToExistingItem(ctx context.Context, fromContentID, toContentID string) error {
 	return s.rebindItemToExistingItem(ctx, fromContentID, toContentID, false)
 }
@@ -8945,7 +8983,7 @@ func (s *MetadataService) rebindItemToExistingItem(ctx context.Context, fromCont
 
 // rebindItemOnto is rebindItemToExistingItem that, with markIdentity, also
 // records an Identify choice on the target in the same transaction.
-func (s *MetadataService) rebindItemOnto(ctx context.Context, fromContentID, toContentID string, allowMatchedSource, markIdentity bool) error { //nolint:funlen // upstream rebindItemOnto exceeds Vio's 100-line limit; refactor tracked separately
+func (s *MetadataService) rebindItemOnto(ctx context.Context, fromContentID, toContentID string, allowMatchedSource, markIdentity bool) error { //nolint:funlen // upstream function exceeds Vio's 100-line limit; refactor tracked separately
 	if s == nil || fromContentID == "" || toContentID == "" || fromContentID == toContentID {
 		return nil
 	}
@@ -9646,6 +9684,7 @@ func itemToMetadataResult(item *models.MediaItem) *MetadataResult {
 		result.SeasonCount = *item.SeasonCount
 	}
 	result.ShowStatus = item.ShowStatus
+	result.EpisodeLabels = item.EpisodeLabels
 
 	return result
 }
@@ -9730,6 +9769,7 @@ func metadataResultToItem(r *MetadataResult, contentType string) *models.MediaIt
 	// manga enrichment pipeline). Pass non-series values through untouched so
 	// a round-trip through itemToMetadataResult can never mangle them.
 	if contentType == "series" {
+		item.EpisodeLabels = models.NormalizeEpisodeLabels(r.EpisodeLabels)
 		item.ShowStatus = showstatus.Normalize(r.ShowStatus)
 	} else {
 		item.ShowStatus = r.ShowStatus
@@ -10004,7 +10044,7 @@ func withoutReplacedFramePoster(item, existing *models.MediaItem) *models.MediaI
 
 // restoreUnfilled gives each slot no provider image filled its stored copy
 // back, so the rest of the merge sees it as if it had never been cleared.
-func (s *storedItemArtwork) restoreUnfilled(item *models.MediaItem) {
+func (s storedItemArtwork) restoreUnfilled(item *models.MediaItem) {
 	for _, slot := range s.slots(item) {
 		if *slot[0] == "" && *slot[1] != "" {
 			*slot[0] = *slot[1]
@@ -10587,6 +10627,9 @@ func ImageTypeToString(t ImageType) string {
 	}
 }
 
+// ImageTypeFromString converts a string to an ImageType. It parses only the
+// types the admin image picker can apply; anything else stays a poster, as it
+// always has for that endpoint.
 // ImageTypeFromString converts a string to an ImageType. "titlecard" is the
 // client-facing name for an episode's still, so it maps to ImageStill: the
 // artwork target validation then accepts it only on episode scope.

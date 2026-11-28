@@ -46,7 +46,7 @@ func DoTrustedNode(client *http.Client, req *http.Request, operation string) (*h
 func TrustedHTTPHandler(role string, next http.Handler) http.Handler {
 	role = Role(role)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, span := otel.Tracer("vio/nodes").Start(ExtractTrusted(r.Context(), r.Header), "node."+role,
+		ctx, span := otel.Tracer("silo/nodes").Start(ExtractTrusted(r.Context(), r.Header), "node."+role,
 			trace.WithSpanKind(trace.SpanKindServer))
 		if span.IsRecording() {
 			span.SetAttributes(attribute.String("role", role))

@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -44,6 +45,17 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 	if err != nil {
 		log.Print("testdb: invalid SILO_TEST_DATABASE_URL; refusing to run")
 		return 1
+	}
+	// The trusted CI integration job hands some steps a plain Postgres named
+	// watch_party, while its pgvector database (silo_test) sits beside it.
+	// Clone the pgvector one; a clone of the plain database cannot apply the
+	// schema.
+	if sibling, ok := pgvectorSiblingDSN(baseCfg, baseDSN); ok {
+		baseDSN = sibling
+		if baseCfg, err = pgxpool.ParseConfig(baseDSN); err != nil {
+			log.Print("testdb: parse pgvector sibling DSN failed")
+			return 1
+		}
 	}
 	if !isDisposableBaseName(baseCfg.ConnConfig.Database) {
 		log.Print("testdb: refusing to clone non-test database")
@@ -110,13 +122,50 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 	return m.Run()
 }
 
+// pgvectorSiblingDSN finds the CI integration job's pgvector database beside
+// a plain watch_party database: same host and credentials, port 5433, database
+// silo_test. ok is false when the sibling is absent, unmigrated or has no
+// vector extension.
+func pgvectorSiblingDSN(base *pgxpool.Config, baseDSN string) (string, bool) {
+	if !strings.EqualFold(base.ConnConfig.Database, "watch_party") {
+		return "", false
+	}
+	u, err := url.Parse(baseDSN)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return "", false
+	}
+	u.Host = net.JoinHostPort(u.Hostname(), "5433")
+	u.Path = "/silo_test"
+	dsn := u.String()
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return "", false
+	}
+	defer pool.Close()
+	var ready bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.goose_db_version') IS NOT NULL
+		AND EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')`).Scan(&ready); err != nil || !ready {
+		return "", false
+	}
+	return dsn, true
+}
+
 func isDisposableBaseName(name string) bool {
 	lower := strings.ToLower(name)
 	// scripts/ci/dbpins names every copy it makes with this prefix, so a
 	// clone a test binary is handed is disposable by construction even when
 	// the template's name carries no marker.
 	return strings.HasPrefix(lower, "dbpins_") ||
-		strings.Contains(lower, "test") || strings.Contains(lower, "purge")
+		strings.Contains(lower, "test") || strings.Contains(lower, "purge") ||
+		// The trusted CI integration job starts its disposable PG17
+		// database under this fixed name.
+		lower == "watch_party"
 }
 
 func disposableName(base, tag string) (string, error) {

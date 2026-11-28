@@ -17,7 +17,7 @@ import (
 const redisRoleLabel = "role"
 
 var cacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "vio_redis_cache_lookups_total", Help: "Redis GET/HGET lookups by result; multi-key operations are excluded.",
+	Name: "silo_redis_cache_lookups_total", Help: "Redis GET/HGET lookups by result; multi-key operations are excluded.",
 }, []string{redisRoleLabel, "result"})
 
 // Command names supplied through Do are arbitrary input too. Never use the
@@ -98,9 +98,9 @@ type redisPoolCollector struct {
 
 var redisPools = &redisPoolCollector{
 	clients:     make(map[weak.Pointer[redis.Client]]string),
-	connections: prometheus.NewDesc("vio_redis_pool_connections", "Connections and pending requests in active Redis client pools.", []string{redisRoleLabel, "state"}, nil),
-	waits:       prometheus.NewDesc("vio_redis_pool_waits", "Cumulative waits/timeouts of currently registered Redis pools; resets on client replacement.", []string{redisRoleLabel, "outcome"}, nil),
-	waitSeconds: prometheus.NewDesc("vio_redis_pool_wait_seconds", "Cumulative time waiting in currently registered Redis pools; resets on client replacement.", []string{redisRoleLabel}, nil),
+	connections: prometheus.NewDesc("silo_redis_pool_connections", "Connections and pending requests in active Redis client pools.", []string{redisRoleLabel, "state"}, nil),
+	waits:       prometheus.NewDesc("silo_redis_pool_waits", "Cumulative waits/timeouts of currently registered Redis pools; resets on client replacement.", []string{redisRoleLabel, "outcome"}, nil),
+	waitSeconds: prometheus.NewDesc("silo_redis_pool_wait_seconds", "Cumulative time waiting in currently registered Redis pools; resets on client replacement.", []string{redisRoleLabel}, nil),
 }
 
 func init() { prometheus.MustRegister(redisPools) }

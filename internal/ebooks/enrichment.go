@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -22,7 +23,6 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/bookid"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/envutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
@@ -59,7 +59,7 @@ func ebookContentType() string {
 
 func ebookEnrichWorkers() int {
 	n := defaultEnrichWorkers
-	if v := envutil.GetenvFirst("VIO_EBOOK_ENRICH_WORKERS", "SILO_EBOOK_ENRICH_WORKERS"); v != "" {
+	if v := os.Getenv("SILO_EBOOK_ENRICH_WORKERS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 			n = parsed
 		}

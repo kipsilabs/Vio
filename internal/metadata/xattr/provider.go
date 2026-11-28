@@ -90,7 +90,6 @@ func getxattr(path, attr string) (string, error) {
 	return string(buf[:n]), nil
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func isNoData(err error) bool {
 	return errors.Is(err, unix.ENODATA) || errors.Is(err, unix.ENOTSUP)
 }

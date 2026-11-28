@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out Vio main
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -138,7 +138,11 @@ jobs:
           if [ -n "$pr_number" ]; then
             gh pr edit "$pr_number" --repo "$GH_REPO" --title "$title" --body "$body"
           else
-            gh pr create --repo "$GH_REPO" --base main --head "$BRANCH" --title "$title" --body "$body" $( [ "$CONFLICT" = "true" ] && echo "--draft" || true )
+            draft=()
+            if [ "$CONFLICT" = "true" ]; then
+              draft+=(--draft)
+            fi
+            gh pr create --repo "$GH_REPO" --base main --head "$BRANCH" --title "$title" --body "$body" "${draft[@]}"
           fi
           if [ "$CONFLICT" = "true" ]; then
             echo "::error::Synchronization branch has merge conflicts requiring manual resolution."

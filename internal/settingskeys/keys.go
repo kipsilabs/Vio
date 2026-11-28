@@ -113,14 +113,6 @@ const (
 	PlayerVideoSkipBackSeconds = "player.video_skip_back_seconds"
 	// Video fast-forward interval
 	PlayerVideoSkipForwardSeconds = "player.video_skip_forward_seconds"
-	// RemuxDB base URL
-	RemuxdbBaseUrl = "remuxdb.base_url"
-	// RemuxDB stream metadata
-	RemuxdbEnabled = "remuxdb.enabled"
-	// Contribute to RemuxDB
-	RemuxdbSubmitEnabled = "remuxdb.submit_enabled"
-	// RemuxDB API token
-	RemuxdbToken = "remuxdb.token"
 	// Request titles I add to my watchlist
 	RequestsWatchlistAutoRequest = "requests.watchlist_auto_request"
 	// Search scope
@@ -224,10 +216,6 @@ var Remote = []string{
 	PlayerVideoGravity,
 	PlayerVideoSkipBackSeconds,
 	PlayerVideoSkipForwardSeconds,
-	RemuxdbBaseUrl,
-	RemuxdbEnabled,
-	RemuxdbSubmitEnabled,
-	RemuxdbToken,
 	RequestsWatchlistAutoRequest,
 	SearchMediaScope,
 	UiAppLanguage,
@@ -276,10 +264,6 @@ var ClientLocal = []string{
 // other.
 var Deprecated = []string{
 	PlaybackAutoSkipIntro,
-	RemuxdbBaseUrl,
-	RemuxdbEnabled,
-	RemuxdbSubmitEnabled,
-	RemuxdbToken,
 	UiCustomCss,
 	UiCustomThemeVars,
 	UiTheme,

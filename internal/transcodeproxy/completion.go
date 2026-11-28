@@ -20,10 +20,10 @@ const (
 	// RequestHeader marks a segment hop whose immediate consumer is another
 	// Silo server, not the playback client. The transcode node defers download
 	// accounting until that server confirms downstream completion.
-	RequestHeader = "X-Vio-Transcode-Proxy"
+	RequestHeader = "X-Silo-Transcode-Proxy"
 	// GenerationHeader carries an opaque session-incarnation and FFmpeg-timeline
 	// token. It is private to Silo hops and must not be forwarded to the client.
-	GenerationHeader = "X-Vio-Transcode-Segment-Generation"
+	GenerationHeader = "X-Silo-Transcode-Segment-Generation"
 )
 
 var representationRequestHeaders = []string{

@@ -22,7 +22,7 @@ func remuxOutcomeCount(t *testing.T, outcome string) float64 {
 	}
 	var total float64
 	for _, family := range families {
-		if family.GetName() != "vio_subprocess_exits_total" {
+		if family.GetName() != "silo_subprocess_exits_total" {
 			continue
 		}
 		for _, metric := range family.Metric {

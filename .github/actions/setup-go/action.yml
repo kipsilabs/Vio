@@ -1,7 +1,8 @@
 name: Set up Go for this repository
 description: >-
-  Installs libvips, the Go toolchain from go.mod, a per-commit build and module
-  cache, and the stub frontend bundle that cmd/silo embeds.
+  Installs the latest Go 1.27 patch, a shared module cache, a
+  per-commit build cache, and the stub frontend bundle that cmd/silo embeds,
+  then waits for the libvips install the job started before checkout.
 
 inputs:
   cache-name:
@@ -11,91 +12,23 @@ inputs:
       binaries), so each keeps a cache that matches its own work.
     required: true
 
+outputs:
+  cache-key:
+    description: The primary key to save after pruning the build cache.
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+
+  module-cache-key:
+    description: The primary key for the shared module cache.
+    value: ${{ steps.modules.outputs.cache-primary-key }}
+
+  module-cache-hit:
+    description: Whether the shared module cache matched its exact key.
+    value: ${{ steps.modules.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
-    # github.com/h2non/bimg binds libvips through cgo and pkg-config, so
-    # nothing under ./... compiles without the headers. The Dockerfile
-    # installs the same package in its build stage.
-    #
-    # On a GitHub-hosted runner the .deb files are cached per runner image: a
-    # warm cache installs them offline with no apt-get update and no downloads,
-    # while a cold cache runs the bounded update and install below. The private
-    # runner image already carries the headers, so pkg-config short-circuits
-    # there.
-    - name: Read the libvips cache key
-      if: runner.environment == 'github-hosted'
-      id: libvips-cache-key
-      shell: bash
-      run: echo "key=libvips-dev-${ImageOS:?}-${ImageVersion:?}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
-
-    - name: Restore the libvips packages
-      if: runner.environment == 'github-hosted'
-      id: libvips-cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/libvips-debs
-        key: ${{ steps.libvips-cache-key.outputs.key }}
-
-    - name: Install libvips
-      shell: bash
-      run: |
-        # The disposable private runner image already includes these headers.
-        if pkg-config --exists vips; then
-          exit 0
-        fi
-        # libvips and its dependencies use the runner's official Ubuntu sources.
-        # The Acquire options bound a stalled or failing mirror: without them
-        # apt-get update once sat on a slow connection for 22 minutes, and with
-        # three retries an install against a mirror returning 502s spent 16
-        # minutes retrying per package. Languages=none skips the translation
-        # indexes. The update below refreshes the runner's mirror selection, so
-        # the install that follows uses whatever mirror is healthy now.
-        test -f /etc/apt/sources.list.d/ubuntu.sources
-        apt_options=(
-          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
-          -o Dir::Etc::sourceparts=-
-          -o Acquire::Retries=1
-          -o Acquire::http::Timeout=20
-          -o Acquire::https::Timeout=20
-          -o Acquire::ForceIPv4=true
-          -o Acquire::Languages=none
-        )
-        if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
-          mkdir -p "$RUNNER_TEMP/libvips-debs"
-          apt_options+=(-o "Dir::Cache::archives=$RUNNER_TEMP/libvips-debs")
-          # sudo apt-get creates lock/ and partial/ in the archive dir as root,
-          # and the cache step then cannot read them, so the save failed and the
-          # cache stayed empty on every run. Hand the dir back before the step
-          # (and any early exit) finishes.
-          trap 'sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/libvips-debs" 2>/dev/null || echo "::warning::could not chown the libvips deb cache; the save may be skipped"' EXIT
-          # The restore has no fallback keys, so packages are present only when
-          # they were saved on this runner image. apt then installs them as
-          # local files without touching the network.
-          debs=("$RUNNER_TEMP"/libvips-debs/*.deb)
-          if [ -e "${debs[0]}" ]; then
-            echo "installing libvips from the cache"
-            if sudo apt-get "${apt_options[@]}" install -y --no-install-recommends --no-download "${debs[@]}"; then
-              exit 0
-            fi
-          fi
-        fi
-        echo "updating package lists"
-        sudo apt-get "${apt_options[@]}" update
-        echo "installing libvips"
-        sudo apt-get "${apt_options[@]}" install -y --no-install-recommends libvips-dev
-
-    # Saved only on a push to main, where the key (the runner image, not the
-    # commit) is shared with every PR. PR runs restore only, so a cold key
-    # cannot be raced into a duplicate save by every job in the run.
-    - name: Save the libvips packages
-      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request' && steps.libvips-cache.outputs.cache-hit != 'true'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: ${{ runner.temp }}/libvips-debs
-        key: ${{ steps.libvips-cache.outputs.cache-primary-key }}
-
-    # setup-go's own cache is keyed on go.sum alone and written only on a
+    # setup-go's own cache is keyed on go.mod and written only on a
     # miss, so between dependency bumps every run restored a build cache
     # from weeks ago and recompiled the tree. The cache below is keyed on the
     # commit and restored by prefix, so each run starts from the newest
@@ -103,12 +36,10 @@ runs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        # Take the toolchain from go.mod, never a range pinned here. setup-go
-        # exports GOTOOLCHAIN=local, so an installed Go older than the module's
-        # `go` directive cannot switch to the required one and every go command
-        # in the job fails with "go.mod requires go >= ...". A range pinned
-        # here also silently lags a branch that raises the module's version.
-        go-version-file: go.mod
+        go-version: '>=1.27 <1.28'
+        # Without check-latest, an older 1.27 cached on the runner image wins
+        # and govulncheck fails on standard library fixes it lacks.
+        check-latest: true
         cache: false
 
     - name: Read the Go version
@@ -116,34 +47,60 @@ runs:
       shell: bash
       run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
 
-    # A PR run restores the build and module cache main last saved but does not
-    # save one. Each lane's cache is 0.6-1.4 GB, and saving a per-PR copy on
-    # every run filled GitHub's 10 GB budget, which then evicted the small
-    # caches (the golangci-lint analysis cache) that make the lint lanes fast.
-    # Only a push to main saves, and the prune job keeps the newest per lane.
-    - name: Restore the Go build and module cache
-      if: runner.environment == 'github-hosted' && github.event_name == 'pull_request'
+    - name: Restore the shared Go module cache
+      if: runner.environment == 'github-hosted'
+      id: modules
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
+        path: ~/go/pkg/mod
+        key: go-mod-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          go-mod-${{ runner.os }}-${{ steps.go.outputs.version }}-
+
+    # The restore below unpacks the build cache while libvips installs in the
+    # background. On tmpfs, those writes and the job's compile output stay off
+    # the disk the install writes to. The path, and so the cache key, is unchanged.
+    #
+    # The vet cache stays on disk. It holds three builds of the tree (Linux
+    # vet, darwin vet, the trimmed darwin node build), about 6 GB for one
+    # commit, and after a go.sum change the restored entries push it past
+    # the tmpfs's 8 GB (half the runner's memory). Go drops cache writes it
+    # has no room for, and route-inventory's go list then fails reading back
+    # a cgo file list it could not write. The decision lives here, not in the
+    # workflow, because pull requests run main's workflow but their own actions.
+    - name: Keep the Go build cache in memory
+      if: runner.environment == 'github-hosted' && inputs.cache-name != 'vet'
+      shell: bash
+      run: |
+        mkdir -p ~/.cache/go-build
+        sudo mount -t tmpfs -o "uid=$(id -u),gid=$(id -g),mode=0755" tmpfs ~/.cache/go-build
+
+    - name: Restore the Go build cache
+      if: runner.environment == 'github-hosted'
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/go-build
         key: go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
         restore-keys: |
           go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-
           go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-
 
-    - name: Restore and save the Go build and module cache
-      if: runner.environment == 'github-hosted' && github.event_name != 'pull_request'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
-        restore-keys: |
-          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-${{ hashFiles('go.sum') }}-
-          go-${{ inputs.cache-name }}-${{ runner.os }}-${{ steps.go.outputs.version }}-
+    - name: Mark restored Go cache entries unused
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      env:
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        cache_dir="$(go env GOCACHE)"
+        mkdir -p "$cache_dir"
+        # A fresh trim stamp stops Go's daily trim from deleting restored entries before the job uses them.
+        date +%s > "$cache_dir/trim.txt"
+        # Only default-branch pushes prune and save GOCACHE; PRs and schedules skip touching every cache file.
+        if [[ "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" && "$GITHUB_EVENT_NAME" != pull_request && "$GITHUB_EVENT_NAME" != schedule ]]; then
+          # Go marks use at most hourly; epoch mtimes force used entries to advance and leave unused entries at epoch.
+          find "$cache_dir" -mindepth 2 -maxdepth 2 \( -name '*-a' -o -name '*-d' \) -exec touch -d '@0' {} +
+        fi
 
     # cmd/silo embeds the built frontend, so nothing under ./... compiles
     # without web/dist. The Go jobs never serve it, so a placeholder is
@@ -151,3 +108,19 @@ runs:
     - name: Stub the embedded frontend bundle
       shell: bash
       run: make embed-stub
+
+    # Nothing compiles without libvips, so the wait only guards against an
+    # install that never reports back; apt times out and retries a stalled
+    # download itself. When the runner image has no cached packages, the
+    # install downloads about 150 packages, which a slow Ubuntu mirror stretches
+    # to several minutes.
+    - name: Wait for libvips
+      shell: bash
+      run: |
+        timeout 900 sh -c 'until [ -s "$RUNNER_TEMP/libvips.status" ]; do sleep 1; done' || {
+          echo "::error::The libvips install did not finish within 15 minutes."
+          cat "$RUNNER_TEMP/libvips.log"
+          exit 1
+        }
+        cat "$RUNNER_TEMP/libvips.log"
+        exit "$(cat "$RUNNER_TEMP/libvips.status")"

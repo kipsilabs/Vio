@@ -9,7 +9,7 @@ import (
 // isolated schema. Rollback leaves the deployment's triggers untouched.
 func TestEpisodeSearchRefreshMigrationPostgres(t *testing.T) {
 	tx, schema := adminMigrationFixture(t)
-	for _, table := range []string{"media_items", "episodes", "episode_libraries", "media_files", "episode_catalog_entries"} {
+	for _, table := range []string{"media_items", "episodes", "episode_libraries", "media_files", "episode_catalog_entries", "episode_aliases"} {
 		migrationExec(t, tx, "CREATE TABLE "+schema+"."+table+" (LIKE public."+table+" INCLUDING ALL)")
 	}
 	// PL/pgSQL keeps the wrapper from being inlined, so its call count shows

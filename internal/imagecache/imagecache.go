@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
@@ -398,7 +399,7 @@ func (c *Cacher) uploadVariants(ctx context.Context, result *imageutil.VariantRe
 
 func variantRevision(result *imageutil.VariantResult) string {
 	h := sha256.New()
-	_, _ = io.WriteString(h, "vio-artwork-v1\x00")
+	_, _ = io.WriteString(h, "silo-artwork-v1\x00")
 	_, _ = io.WriteString(h, result.Ext)
 	_, _ = h.Write([]byte{0})
 	variants := append([]imageutil.Variant(nil), result.Variants...)
@@ -444,7 +445,9 @@ func putObjectWithRetry(ctx context.Context, putter ObjectPutter, key string, da
 		err := putter.Put(ctx, key, data)
 		if err != nil {
 			lastErr = err
-			if attempt == maxAttempts-1 {
+			// A full disk does not clear in a second; the job queue waits
+			// for space instead.
+			if attempt == maxAttempts-1 || errors.Is(err, syscall.ENOSPC) {
 				break
 			}
 			timer := time.NewTimer(time.Duration(attempt+1) * 500 * time.Millisecond)

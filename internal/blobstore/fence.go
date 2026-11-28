@@ -5,7 +5,6 @@ import (
 	"io"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -19,21 +18,9 @@ type MutationFencer interface {
 	BeginMutationFence(context.Context) (func(), error)
 }
 
-// MutationFenceReporter reports whether a store currently holds an unreleased
-// mutation fence. A storage transition that commits keeps its source fences
-// until the process restarts, so this lets the process surface "writes are
-// blocked" to health reporting instead of only failing writes silently.
-type MutationFenceReporter interface {
-	MutationsFenced() bool
-}
-
 type fencedStore struct {
 	Store
 	mutations *semaphore.Weighted
-	// fenced is set while a mutation fence is held and cleared when its release
-	// function runs. A fence retained after commit stays set for the process
-	// lifetime.
-	fenced atomic.Bool
 }
 
 func (s *fencedStore) unwrapStore() Store { return s.Store }
@@ -100,30 +87,8 @@ func (s *fencedStore) BeginMutationFence(ctx context.Context) (func(), error) {
 	if err := s.mutations.Acquire(ctx, mutationFenceWeight); err != nil {
 		return nil, err
 	}
-	s.fenced.Store(true)
 	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.fenced.Store(false)
-			s.mutations.Release(mutationFenceWeight)
-		})
-	}, nil
-}
-
-// MutationsFenced reports whether this store currently holds an unreleased
-// mutation fence. A transition that commits retains its fences until restart,
-// so a true value after a transition committed means writes are stalled.
-func (s *fencedStore) MutationsFenced() bool { return s.fenced.Load() }
-
-// FencedStores reports whether any provided store currently holds an unreleased
-// mutation fence. Stores without fence support are ignored.
-func FencedStores(stores ...Store) bool {
-	for _, store := range stores {
-		if reporter, ok := store.(MutationFenceReporter); ok && reporter.MutationsFenced() {
-			return true
-		}
-	}
-	return false
+	return func() { once.Do(func() { s.mutations.Release(mutationFenceWeight) }) }, nil
 }
 
 // PauseMutations fences each distinct store once and returns the function that

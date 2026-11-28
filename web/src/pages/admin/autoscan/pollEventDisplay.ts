@@ -109,8 +109,11 @@ export function scanStatusClass(
       return "border-sky-500/30 bg-sky-500/10 text-sky-500";
     case "accepted":
       return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
+    case "cancelled":
     case "canceled":
       return "border-amber-500/30 bg-amber-500/10 text-amber-500";
+    default:
+      return "border-muted-foreground/25 bg-muted/60 text-muted-foreground";
   }
 }
 
@@ -120,6 +123,7 @@ export const SCAN_STATUS_LABELS: Record<AutoscanScanStatus | ScanRun["status"], 
   running: "web.admin.autoscan.activity.scanStatus.running",
   completed: "web.admin.autoscan.activity.scanStatus.completed",
   failed: "web.admin.autoscan.activity.scanStatus.failed",
+  cancelled: "web.admin.autoscan.activity.scanStatus.cancelled",
   canceled: "web.admin.autoscan.activity.scanStatus.cancelled",
 };
 
@@ -128,6 +132,7 @@ export const SCAN_STATUS_FILTER_LABELS: Record<AutoscanScanStatus, MessageKey> =
   running: "web.admin.autoscan.activity.scanFilter.running",
   completed: "web.admin.autoscan.activity.scanFilter.completed",
   failed: "web.admin.autoscan.activity.scanFilter.failed",
+  cancelled: "web.admin.autoscan.activity.scanFilter.cancelled",
   canceled: "web.admin.autoscan.activity.scanFilter.cancelled",
 };
 
@@ -136,7 +141,7 @@ export const SCAN_STATUS_ORDER: readonly AutoscanScanStatus[] = [
   "accepted",
   "completed",
   "failed",
-  "canceled",
+  "cancelled",
 ];
 
 // Name every Activity row the way the Sources list titles the source, so the

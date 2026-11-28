@@ -378,29 +378,6 @@ a `requests.ApprovalOrigin`, and the requester notice requires
 unrecognized one is logged, so a new policy-driven path cannot reintroduce the
 notice by omission.
 
-## Rating notifications
-
-When a profile rates an item, the ratings API posts one durable `rating.set`
-delivery gated on the profile's master notification toggle. The delivery's
-`reason_flags` carry the rating value (`{"rating": <1-5>}`), and the rated
-item's parent series is resolved so the delivery row can join catalog metadata
-for outbound rendering. The delivery is written only when the profile has at
-least one rating-enabled subscriber — a webhook with `notify_ratings` set, a
-web-push subscription, or an admin-enabled push platform with a device — so a
-rating on an unsubscribed profile costs nothing but the pre-checks. Delivery
-is best-effort and non-blocking: a delivery failure never fails the rating
-write.
-
-`notify_ratings` is a per-webhook boolean on the outbound-webhook API
-(`GET/POST /notifications/webhooks`, `PUT /notifications/webhooks/{id}`),
-defaulting to `false`, alongside the existing `notify_favorites`,
-`notify_watchlist`, `notify_continue_watching`, `notify_next_up`, and
-`notify_requests` flags. It gates only the `rating.set` delivery type; the
-other per-webhook reason filters are unaffected. Discord embeds for
-`rating.set` use a gold accent; generic webhooks receive the canonical Silo
-JSON with `type: "rating.set"` and a dedicated `rating` object carrying the
-value and the rated item's id.
-
 ## Watchlist arrivals
 
 A profile that watchlisted a movie or series before the library had it is told

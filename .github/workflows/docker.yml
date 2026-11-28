@@ -90,26 +90,28 @@ jobs:
             image_version="build-${build_number}"
           fi
 
-          echo "build_number=${build_number}" >> "$GITHUB_OUTPUT"
-          echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-          echo "image_version=${image_version}" >> "$GITHUB_OUTPUT"
-          echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
+          {
+            echo "build_number=${build_number}"
+            echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "image_version=${image_version}"
+            echo "is_stable=${is_stable}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.release.tag_name || github.sha }}
 
       - name: Set up pnpm for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           package_json_file: web/package.json
 
       - name: Set up Node.js for manual frontend build
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "22"
           cache: pnpm
@@ -122,7 +124,7 @@ jobs:
 
       - name: Upload frontend bundle for manual builds
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: frontend-dist-${{ github.sha }}
           path: web/dist
@@ -146,7 +148,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -158,7 +160,7 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
 
       - name: Download validated frontend bundle
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         if: github.event_name == 'workflow_run'
         with:
           name: frontend-dist-${{ github.event.workflow_run.head_sha || github.sha }}
@@ -167,7 +169,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Download frontend bundle for manual builds
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         with:
           name: frontend-dist-${{ github.sha }}
@@ -182,10 +184,10 @@ jobs:
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Cache Go build cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         # Cache-service flakiness must not fail the image build.
         continue-on-error: true
         with:
@@ -196,7 +198,7 @@ jobs:
             go-build-${{ env.PLATFORM_PAIR }}-
 
       - name: Inject and persist Go build cache
-        uses: reproducible-containers/buildkit-cache-dance@v3
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3
         # The inject round-trip can time out waiting for the arm64 BuildKit
         # builder; the cache is an optimization, so retry once and otherwise
         # degrade to a full uncached build instead of failing the image.
@@ -210,7 +212,7 @@ jobs:
             }
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -218,7 +220,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           labels: |
@@ -228,7 +230,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           # Attestations are never read by the digest + manifest-merge flow, so skip
           # generating them: cheaper builds and a smaller cache-to upload.
@@ -255,7 +257,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -273,17 +275,17 @@ jobs:
         run: echo "IMAGE_LC=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
       - name: Download digests
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -304,7 +306,7 @@ jobs:
       # because the omnibus build consumes it.
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           tags: |
@@ -399,7 +401,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           flavor: |

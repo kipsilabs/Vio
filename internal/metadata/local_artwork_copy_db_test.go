@@ -170,7 +170,7 @@ func writeSidecar(t *testing.T, path string) string {
 // and person artwork copies it, other drains cannot take the jobs during the
 // discovery hold, and every job ends succeeded with the cached copy written to
 // its slot.
-func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLocalArtworkCopiedOnDiscoveryDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := imageCacheQueueTestPool(t)
 	ctx := context.Background()
 	seriesID := fmt.Sprintf("series:local-copy-%d", time.Now().UnixNano())
@@ -400,7 +400,7 @@ func TestLocalArtworkCopiedOnDiscoveryDB(t *testing.T) { //nolint:funlen,gocyclo
 // week-long stable-failure delay, and waits longer when that repeats. A file
 // missing from a folder the server does see stays a stable failure, and
 // confinement still rejects a symlink escaping the root.
-func TestLocalArtworkRetriesWithoutLibraryRootDB(t *testing.T) { //nolint:funlen,gocyclo // upstream TestLocalArtworkRetriesWithoutLibraryRootDB exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func TestLocalArtworkRetriesWithoutLibraryRootDB(t *testing.T) { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	pool := imageCacheQueueTestPool(t)
 	ctx := context.Background()
 
@@ -549,5 +549,55 @@ func TestLocalArtworkRetriesWithoutLibraryRootDB(t *testing.T) { //nolint:funlen
 			t.Fatalf("symlink: %v", err)
 		}
 		assertStableFailure(t, run(t, []string{root}, "file://"+filepath.Join(root, "Art", "poster.jpg")+"?v=12-1700000000"), "local image missing")
+	})
+}
+
+// TestLocalArtworkWaitsForStorageSpaceDB pins how a manual refresh treats a
+// job waiting for the artwork store to have room: it starts the deferral
+// over, whether or not the wait has run out, so the next refusal waits the
+// short delay rather than the repeat one.
+func TestLocalArtworkWaitsForStorageSpaceDB(t *testing.T) {
+	pool := imageCacheQueueTestPool(t)
+	ctx := context.Background()
+	repo := NewImageCacheJobRepository(pool)
+	contentID := fmt.Sprintf("movie:storage-full-%d", time.Now().UnixNano())
+	cleanupLocalArtworkJobs(t, pool, contentID)
+	if err := repo.Enqueue(ctx, EnqueueImageCacheJobInput{
+		TargetType: ImageCacheTargetItem, TargetContentID: contentID, SeriesID: contentID,
+		ContentType: "movie", ImageType: ImageCacheImagePoster, SourcePath: "file:///media/Film/poster.jpg",
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	deferForSpace := func() {
+		t.Helper()
+		jobs, err := repo.claimDueForTarget(ctx, "full-server", contentID, 1)
+		if err != nil || len(jobs) != 1 {
+			t.Fatalf("claim = %d jobs, %v; want 1", len(jobs), err)
+		}
+		if err := repo.DeferClaimed(ctx, jobs[0].ID, jobs[0].LockedBy, imageCacheStorageFullError, imageCacheStorageFullRetry, imageCacheStorageFullRepeatRetry); err != nil {
+			t.Fatalf("defer: %v", err)
+		}
+	}
+	refreshAndDeferAgain := func(t *testing.T) {
+		t.Helper()
+		if err := repo.retryTargetNow(ctx, contentID); err != nil {
+			t.Fatalf("retryTargetNow: %v", err)
+		}
+		deferForSpace()
+		got := readLocalArtworkJob(t, pool, ImageCacheTargetItem, contentID, ImageCacheImagePoster)
+		if got.attempts != 0 || got.lastError != imageCacheStorageFullError || got.nextAttemptIn > imageCacheStorageFullRetry+time.Minute {
+			t.Fatalf("after a refresh = %+v, want queued again within %s", got, imageCacheStorageFullRetry)
+		}
+	}
+	deferForSpace()
+
+	t.Run("while waiting", refreshAndDeferAgain)
+	t.Run("once the wait ran out", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `
+			UPDATE metadata_image_cache_jobs SET next_attempt_at = NOW() - interval '1 second' WHERE target_content_id = $1
+		`, contentID); err != nil {
+			t.Fatalf("let the wait run out: %v", err)
+		}
+		refreshAndDeferAgain(t)
 	})
 }

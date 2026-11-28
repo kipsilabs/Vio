@@ -129,7 +129,7 @@ func (s *session) writingCount() int {
 func NewManager(opts ManagerOptions) *Manager {
 	rootDir := opts.RootDir
 	if strings.TrimSpace(rootDir) == "" {
-		rootDir = filepath.Join(os.TempDir(), "vio-uploads")
+		rootDir = filepath.Join(os.TempDir(), "silo-uploads")
 	}
 	ttl := opts.TTL
 	if ttl <= 0 {
@@ -663,11 +663,5 @@ func newID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// MaxChunkSize reports the largest chunk a request body may carry for one
-// upload. Plugin upload handlers bound the body with it before reading.
-func (m *Manager) MaxChunkSize() int64 {
-	if m == nil {
-		return 0
-	}
-	return m.maxChunkSize
-}
+// MaxChunkSize is the largest upload chunk a client may send.
+func (m *Manager) MaxChunkSize() int64 { return m.maxChunkSize }

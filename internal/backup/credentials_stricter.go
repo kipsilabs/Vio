@@ -59,9 +59,13 @@ const (
 	tablePersonalCollections = "user_personal_collections"
 )
 
-// The keys a row is matched by.
+// The keys a row is matched by. An account is matched by its name and when
+// it was created, as sameAccount matches one: a live account created since
+// the backup can hold an id, and even a name, that another account has in
+// the backup. The time is written in UTC, so neither session's time zone
+// changes it.
 const (
-	accountKey = `lower(coalesce(t.username, t.email, ''))`
+	accountKey = `lower(coalesce(t.username, t.email, '')) || ' ' || to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')`
 	pluginKey  = `t.plugin_id`
 	noKey      = `''`
 	profileKey = `t.user_id::text`
@@ -192,8 +196,10 @@ const (
 // not stricterFlags, each with why the backup's value is the one to keep.
 var restoredFlagColumns = map[string]string{
 	"access_groups.is_default":                                "which group new accounts join; the invitation carry compares the policy it grants",
+	"admin_playback_history.compat_origin":                    whyHistory,
 	"admin_playback_history.completed":                        whyHistory,
 	"admin_playback_history.measured":                         whyHistory,
+	"admin_playback_history.route_facts_recorded":             whyHistory,
 	"autoscan_settings.id":                                    whyKey,
 	"download_artifacts.progress_unavailable":                 whyFacts,
 	"download_artifacts.tone_map_dv_bl_compat_id_present":     whyFacts,
@@ -211,9 +217,6 @@ var restoredFlagColumns = map[string]string{
 	"episode_catalog_entries.has_non_dolby_vision":            whyFacts,
 	"episode_catalog_entries.has_non_hdr":                     whyFacts,
 	"item_videos.is_official":                                 whyFacts,
-	"media_files.copy_safety_multi":                           whyFacts,
-	"user_device_profiles.dolby_vision":                       whyFacts,
-	"user_device_profiles.hdr":                                whyFacts,
 	"library_collections.featured":                            whyShown,
 	"library_collections.poster_auto_generated":               whyShown,
 	"library_collections.poster_from_template":                whyShown,
@@ -222,6 +225,7 @@ var restoredFlagColumns = map[string]string{
 	"local_metadata_default_on_chain_backup.up_enabled":       whyMigration,
 	"marker_contributions.claim_active":                       whyQueue,
 	"marker_provider_config.fetch_enabled":                    "fetching markers sends nothing of the server's",
+	"media_files.copy_safety_multi":                           whyFacts,
 	"media_files.hdr":                                         whyFacts,
 	"media_files.multiple_pps":                                whyFacts,
 	"media_folders.allow_empty_cleanup_once":                  "a one-shot scan instruction",
@@ -249,6 +253,8 @@ var restoredFlagColumns = map[string]string{
 	"request_settings.id":                                     whyKey,
 	"series_root_match_queue.lease_forced_rerun":              whyQueue,
 	"series_root_match_queue.rerun_requested":                 whyQueue,
+	"user_device_profiles.dolby_vision":                       whyFacts,
+	"user_device_profiles.hdr":                                whyFacts,
 	"user_downloads.transcoded":                               whyFacts,
 	"user_library_playback_preferences.show_forced_subtitles": whyPlayback,
 	"user_login_identifiers.legacy_duplicate":                 whyMigration,

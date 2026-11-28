@@ -132,3 +132,72 @@ that before it ships.
    `internal/catalog` virtual suites against a disposable DB, `internal/api`
    router tests, web typecheck plus touched step tests).
 5. Push. The image pipeline builds from the merge.
+
+## Deferred upstream adoption
+
+The 2026-11-27 sync merges upstream's non-playback work and keeps the fork's
+playback engine. Upstream's playback/session rework is **not adopted at this
+base**; it is deferred as a project, not dropped by accident.
+
+Deferred upstream projects:
+
+- Playback engine and session handling: #5269, #5293, #5412, #5438, #4641,
+  #4604, #4639, #5117, #4476, #4572, #5180, #4621, #4478, #4620, #5144, #5133.
+- Transcode-node job admission and thin-node work: #5446, #4504, and the
+  signed node-source/thin-node runtime (already listed under "Upstream work
+  deliberately not adopted").
+- Admin Insights and the Playback History rework: #5279, #5321, #5301, which
+  are built on the #5269 session/history schema.
+
+The sync also keeps the fork's API/UI layer at this base, because upstream
+rewrote the handler and catalog files those divergences sit on:
+
+- `internal/api/handlers` and `internal/catalog`: virtual-library reads,
+  collections and poster handling, version liveness, and the handler views the
+  fork's v2 layer serves.
+- `internal/apiv2`: upstream's v2 files call handler and catalog APIs that only
+  exist in upstream's rewritten handler layer.
+- `web/`: the app consumes the pinned v2 contract; upstream's web changes ride
+  with the deferred v2 surface.
+
+A future adoption therefore starts by porting the fork handler layer onto
+upstream's `items.go`, `collections.go`, collection repository and detail
+reads, then moves `internal/apiv2` and `web/` with it. The deferred upstream
+handler and catalog fixes from this window (item collections, card
+availability, profile request blocking, version-liveness reads, poster
+handling) come with that work.
+
+Reason: the fork's playback engine is a deliberate divergence
+(`internal/playback`, the virtual-library playback paths, the compat wiring,
+and #482–#495). The upstream projects above rewrite the same session, copy,
+stream-end, and history machinery those divergences sit on, and their
+generated contracts and admin views follow it. Adopting them is a separate
+project with its own validation, not a merge-time conflict resolution.
+
+What a future adoption implies:
+
+- Take upstream's `internal/playback` and `internal/transcodenode` wholesale,
+  replace the fork planner (`plan_v3.go`, `transcode.go`) and the virtual
+  playback dispatch (`playback_virtual*.go`, `internal/jellycompat` virtual
+  wiring), and keep the #482–#495 fixes by re-deriving them on the new engine.
+- Rebuild the apiv2 session/history/insights surfaces and their generated
+  contracts in the same change; the admin sessions payload, playback history
+  fixtures, and the Insights breakdowns move together.
+- Re-run the fork's virtual-library playback suites and the compat router
+  wiring test; both pin behaviour the rework changes.
+
+### Fork fixes carried inside the deferred surface
+
+These fixes sit on the fork engine/API and are preserved with it. Each is part
+of why the surface is deferred rather than merged hunk by hunk.
+
+| Fix | What it keeps |
+| --- | --- |
+| #482 | Undated empty seasons render and page correctly (catalog season reads). |
+| #483 | The request dialog's TVDB/TMDB season-source picker (`season_source` on requests, detail read, `media_requests.season_source`). |
+| #485 | Plugin identity headers under both `X-Vio-*` and the documented `X-Silo-*`. |
+| #487 | Provider preview requests use `no-referrer` (web image preview). |
+| #490 | Jellyfin virtual playback wiring: every virtual-library dependency reaches `NewRouter`'s `PlaybackHandler`; without it `/Videos/{id}/stream` answers 502. |
+| #492 | On-demand virtual identity repair, off by default. |
+| #493 | Virtual probe bounds for detail reads and liveness checks. |
+| #495 | Copy-seek retry escalation between segment restarts. |

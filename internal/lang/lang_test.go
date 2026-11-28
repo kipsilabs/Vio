@@ -91,58 +91,11 @@ func TestCanonical(t *testing.T) {
 		{"english", "english"},
 		{"klingon", "klingon"},
 		{"  Ja  ", "ja"},
-		// "und"/"mul" are preserved verbatim, never remapped to English.
-		{"und", "und"},
-		{"mul", "mul"},
-		{"UND", "und"},
-		{"undetermined", "und"},
-		{"multiple", "mul"},
 	}
 	for _, tc := range cases {
 		got := Canonical(tc.in)
 		if got != tc.want {
 			t.Errorf("Canonical(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestParseLanguages(t *testing.T) {
-	cases := []struct {
-		in   string
-		want []string
-	}{
-		{"English / French / Spanish", []string{"en", "fr", "es"}},
-		{"Eng/Fra/Deu", []string{"en", "fr", "de"}},
-		{"AC3 5.1 English+French+Spanish", []string{"en", "fr", "es"}},
-		{"English", []string{"en"}},
-		{"SyncUP", nil},
-		{"Audio Commentary", nil},
-		{"DTS 5.1", nil},
-		{"", nil},
-		{"   ", nil},
-		// Uppercase 2-letter codes are unambiguous.
-		{"EN/FR", []string{"en", "fr"}},
-		// Lowercase 2-letter tokens are rejected to avoid English-word
-		// false positives ("it", "no", "hi").
-		{"it/no", nil},
-		// Junk alone yields nil even when it looks code-like.
-		{"7.1", nil},
-		{"German DTS-HD 5.1", []string{"de"}},
-	}
-	for _, tc := range cases {
-		got := ParseLanguages(tc.in)
-		if (got == nil) != (tc.want == nil) {
-			t.Errorf("ParseLanguages(%q) nil mismatch: got %v, want %v", tc.in, got, tc.want)
-			continue
-		}
-		if len(got) != len(tc.want) {
-			t.Errorf("ParseLanguages(%q) = %v, want %v", tc.in, got, tc.want)
-			continue
-		}
-		for i := range tc.want {
-			if got[i] != tc.want[i] {
-				t.Errorf("ParseLanguages(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
-			}
 		}
 	}
 }
@@ -239,63 +192,5 @@ func TestCodeAliases(t *testing.T) {
 		if got := CodeAliases(input); !slices.Equal(got, want) {
 			t.Errorf("CodeAliases(%q) = %v, want %v", input, got, want)
 		}
-	}
-}
-
-func TestMatchRank(t *testing.T) {
-	cases := []struct {
-		candidate string
-		preferred string
-		want      int
-	}{
-		// Exact matches (0)
-		{"en", "en", RankExactMatch},
-		{"en-US", "en-US", RankExactMatch},
-		{"zh-Hans", "zh-Hans", RankExactMatch},
-		{"zh-Hant", "zh-Hant", RankExactMatch},
-		{"fr-CA", "fr-CA", RankExactMatch},
-
-		// Matching script or region (1 or 2)
-		{"zh-Hans-CN", "zh-Hans", RankMatchingScript},
-		{"zh-Hant-TW", "zh-Hant", RankMatchingScript},
-		{"zh-CN", "zh-Hans", RankMatchingScript},
-		{"zh-Hans-foobar", "zh-Hans", RankMatchingScript},
-
-		// Bare language candidate (3)
-		{"fr", "fr-CA", RankBareLanguage},
-		{"en", "en-US", RankBareLanguage},
-		{"zh", "zh-Hans", RankBareLanguage},
-		{"zh", "zh-Hant", RankBareLanguage},
-		{"zh", "zh-TW", RankBareLanguage},
-
-		// Regional variant with compatible script (4)
-		{"fr-BE", "fr-CA", RankRegionalVariant},
-		{"en-GB", "en-US", RankRegionalVariant},
-		{"zh-Hans", "zh", RankRegionalVariant},
-		{"zh-Hant", "zh", RankRegionalVariant},
-		{"zh-HK", "zh-TW", RankRegionalVariant},
-
-		// Conflicting script (5)
-		{"zh-Hant", "zh-Hans", RankScriptConflict},
-		{"zh-Hans", "zh-Hant", RankScriptConflict},
-		{"zh-TW", "zh-Hans", RankScriptConflict},
-		{"zh-CN", "zh-Hant", RankScriptConflict},
-		{"zh-CN", "zh-TW", RankScriptConflict},
-		{"zh-Hant-foobar", "zh-Hans", RankScriptConflict},
-
-		// Mismatch (-1)
-		{"de", "fr-CA", -1},
-		{"", "en", -1},
-		{"en", "", -1},
-		{"und", "en", -1},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.candidate+"_vs_"+tc.preferred, func(t *testing.T) {
-			got := MatchRank(tc.candidate, tc.preferred)
-			if got != tc.want {
-				t.Errorf("MatchRank(%q, %q) = %d, want %d", tc.candidate, tc.preferred, got, tc.want)
-			}
-		})
 	}
 }

@@ -48,6 +48,8 @@ func TestAPIKeyScopesAllow(t *testing.T) {
 		{"monitor sessions", monitor, http.MethodGet, "/api/v2/admin/sessions?limit=50", true},
 		{"monitor history", monitor, http.MethodGet, "/api/v2/admin/playback-history", true},
 		{"monitor history capabilities", monitor, http.MethodGet, "/api/v2/admin/playback-history/capabilities", true},
+		{"monitor history entry detail", monitor, http.MethodGet, "/api/v2/admin/playback-history/sess-123", true},
+		{"monitor history denies nested path", monitor, http.MethodGet, "/api/v2/admin/playback-history/sess-123/extra", false},
 		{"monitor activity stats", monitor, http.MethodGet, "/api/v2/admin/stats/top-activity", true},
 		{"monitor stream timeseries", monitor, http.MethodGet, "/api/v2/admin/stats/timeseries", true},
 		{"monitor user detail", monitor, http.MethodGet, "/api/v2/admin/users/42", true},

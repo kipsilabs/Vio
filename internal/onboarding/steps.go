@@ -4,7 +4,6 @@ package onboarding
 const (
 	StepIDWelcome         = "welcome"
 	StepIDPlaybackQuality = "playback-quality"
-	StepIDStreaming       = "streaming"
 	StepIDWatchTogether   = "watch-together"
 	StepIDRequests        = "requests"
 	StepIDRecommendations = "recommendations"
@@ -22,7 +21,7 @@ var tourSteps = []Step{
 	{
 		ID:           StepIDWelcome,
 		Kind:         KindWelcome,
-		Title:        "Vio isn't quite like the others",
+		Title:        "Silo isn't quite like the others",
 		Body:         "You've probably used Plex or Jellyfin. Most of this will feel familiar — but a handful of things work differently here, and they're worth two minutes.",
 		Illustration: "welcome",
 	},
@@ -30,7 +29,7 @@ var tourSteps = []Step{
 		ID:    StepIDPlaybackQuality,
 		Kind:  KindSettingChoice,
 		Title: "Pick a quality ceiling now, change it anywhere",
-		Body:  "Vio won't burn your data plan guessing. Set a ceiling and it sticks. You can override it per device, per library, or per show later.",
+		Body:  "Silo won't burn your data plan guessing. Set a ceiling and it sticks. You can override it per device, per library, or per show later.",
 		Setting: &SettingSpec{
 			Target:  TargetProfileField,
 			Key:     "quality_preference",
@@ -66,7 +65,7 @@ var tourSteps = []Step{
 		ID:           "favorites-watchlist",
 		Kind:         KindFeatureCard,
 		Title:        "Favorites teach, your Watchlist remembers",
-		Body:         "Favorites tell Vio what you love and shape your recommendations. Your Watchlist is the get-to-it-eventually pile — and Vio tells you when something on it arrives. Both live in the sidebar under Your Stuff.",
+		Body:         "Favorites tell Silo what you love and shape your recommendations. Your Watchlist is the get-to-it-eventually pile — and Silo tells you when something on it arrives. Both live in the sidebar under Your Stuff.",
 		Illustration: "watchlist",
 	},
 	{
@@ -78,15 +77,6 @@ var tourSteps = []Step{
 		Route:        "/rooms",
 		ActionLabel:  "Open Watch Party",
 		gate:         gateWatchTogether,
-	},
-	{
-		ID:           StepIDStreaming,
-		Kind:         KindFeatureCard,
-		Title:        "Stream anything with Stremio",
-		Body:         "Vio streams straight from a Stremio addon provider — no files to manage. The admin pastes a provider manifest URL once, and the whole catalog appears as virtual libraries.",
-		Illustration: StepIDStreaming,
-		Route:        "/requests",
-		ActionLabel:  "Browse the catalog",
 	},
 	{
 		ID:           StepIDRequests,
@@ -102,7 +92,7 @@ var tourSteps = []Step{
 		ID:           StepIDRecommendations,
 		Kind:         KindFeatureCard,
 		Title:        "Recommendations from taste, not popularity",
-		Body:         "Vio learns from what you actually watch and favorite on this server — not a global chart. The more you use it, the better the home screen gets.",
+		Body:         "Silo learns from what you actually watch and favorite on this server — not a global chart. The more you use it, the better the home screen gets.",
 		Illustration: StepIDRecommendations,
 		gate:         gateRecommendations,
 	},
@@ -119,8 +109,8 @@ var tourSteps = []Step{
 	{
 		ID:           StepIDApps,
 		Kind:         KindFeatureCard,
-		Title:        "Take Vio with you",
-		Body:         "Vio has native apps for iPhone, iPad, Apple TV, Android, and Android TV. Sign in with this same email address and your profile, Watchlist, and watch progress follow you to every screen.",
+		Title:        "Take Silo with you",
+		Body:         "Silo has native apps for iPhone, iPad, Apple TV, Android, and Android TV. Sign in with this same email address and your profile, Watchlist, and watch progress follow you to every screen.",
 		Illustration: StepIDApps,
 		Links: []StepLink{
 			{Label: "iPhone & Apple TV", URL: "https://testflight.apple.com/join/XZy8cu5q"},
@@ -132,7 +122,7 @@ var tourSteps = []Step{
 		ID:           StepIDJellyfinCompat,
 		Kind:         KindFeatureCard,
 		Title:        "Already use a Jellyfin app? It works here",
-		Body:         "Vio speaks the Jellyfin API, so players like Infuse, VidHub, Findroid, and Swiftfin can connect to this server directly — add it as a Jellyfin server with this address and your Vio sign-in.",
+		Body:         "Silo speaks the Jellyfin API, so players like Infuse, VidHub, Findroid, and Swiftfin can connect to this server directly — add it as a Jellyfin server with this address and your Silo sign-in.",
 		Illustration: "jellyfin",
 		webOnly:      true,
 		gate:         gateJellyfinCompat,

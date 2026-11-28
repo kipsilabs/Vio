@@ -20,8 +20,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/Silo-Server/silo-server/internal/envutil"
 )
 
 const (
@@ -30,9 +28,7 @@ const (
 	DefaultStallWindow = 180 * time.Second
 
 	// stallWindowEnv overrides DefaultStallWindow (integer seconds).
-	// VIO_STREAM_WRITE_STALL_TIMEOUT wins; SILO_* is the legacy fallback.
-	stallWindowEnv       = "VIO_STREAM_WRITE_STALL_TIMEOUT"
-	stallWindowEnvLegacy = "SILO_STREAM_WRITE_STALL_TIMEOUT"
+	stallWindowEnv = "SILO_STREAM_WRITE_STALL_TIMEOUT"
 
 	// bumpStep rate-limits deadline updates so a busy stream issues one
 	// SetWriteDeadline per step rather than one per 32 KB chunk. It applies to
@@ -59,7 +55,7 @@ const (
 
 // StallWindow returns the configured stall window for streaming responses.
 func StallWindow() time.Duration {
-	if v := envutil.GetenvFirst(stallWindowEnv, stallWindowEnvLegacy); v != "" {
+	if v := os.Getenv(stallWindowEnv); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
 			return time.Duration(secs) * time.Second
 		}

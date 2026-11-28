@@ -55,7 +55,11 @@ type CompleteOAuthLoginInput struct {
 		Code         string `json:"code" minLength:"1" maxLength:"128" doc:"Completion code from the callback redirect; single use" example:"3f2b47eb7b36dd2d"`
 		CodeVerifier string `json:"code_verifier,omitempty" maxLength:"128" doc:"PKCE code verifier of the challenge a native start sent (RFC 7636: 43 to 128 unreserved characters). Required for a code from startNativeOAuthLogin, refused for a web code; either mismatch is 400 invalid_grant and leaves the code redeemable" example:"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"`
 	}
-	Browser string `cookie:"vio_oauth_complete" doc:"Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it"`
+	Browser string `cookie:"silo_oauth_complete" doc:"Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it"`
+	// BrowserLegacy is the fork's earlier cookie name. It stays on the wire
+	// (additive-only contract) and is accepted while clients and servers roll
+	// forward together.
+	BrowserLegacy string `cookie:"vio_oauth_complete" doc:"Deprecated completion cookie name; accepted during the transition"`
 }
 
 // OAuthCompletion is the credential the code redeemed, plus where the
@@ -103,7 +107,7 @@ func registerAuth(reg *Registry) {
 	}, reg.login)
 	complete := humaOp(http.MethodPost, Prefix+"/auth/oauth/complete", "completeOAuthLogin", "auth",
 		"Redeem the one-time code an OAuth callback issued for the token pair.")
-	complete.Description = "A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the vio_oauth_complete cookie, so a code passed to another browser cannot sign that browser in."
+	complete.Description = "A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the silo_oauth_complete cookie, so a code passed to another browser cannot sign that browser in."
 	// An unknown, used or expired code is 401 invalid_token; a verifier
 	// that does not fit the code is 400 invalid_grant.
 	complete.Errors = []int{http.StatusBadRequest, http.StatusUnauthorized}
@@ -213,7 +217,11 @@ func (reg *Registry) completeOAuthLogin(ctx context.Context, in *CompleteOAuthLo
 	if reg.deps.OAuth == nil || reg.deps.Accounts == nil {
 		return nil, unavailable("oauth login")
 	}
-	c, err := reg.deps.OAuth.Complete(withClientDevice(ctx), in.Body.Code, in.Body.CodeVerifier, in.Browser)
+	browser := in.Browser
+	if browser == "" {
+		browser = in.BrowserLegacy
+	}
+	c, err := reg.deps.OAuth.Complete(withClientDevice(ctx), in.Body.Code, in.Body.CodeVerifier, browser)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrOAuthCompletionUnavailable):

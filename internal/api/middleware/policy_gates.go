@@ -15,9 +15,7 @@ import (
 )
 
 const (
-	deviceIDHeader                     = "X-Vio-Device-Id"
-	legacyDeviceIDHeader               = "X-Silo-Device-Id"
-	siloDeviceIDHeader                 = deviceIDHeader // legacy alias; prefer deviceIDHeader.
+	siloDeviceIDHeader                 = "X-Silo-Device-Id"
 	policyInternalErrorCode            = "internal_error"
 	activeProfileVerificationFailedMsg = "Failed to verify active profile"
 	metadataCurationRequiredMsg        = "Metadata curation permission required"
@@ -357,8 +355,5 @@ func policyRequestTime() string {
 }
 
 func policyDeviceID(r *http.Request) string {
-	if v := r.Header.Get(deviceIDHeader); v != "" {
-		return v
-	}
-	return r.Header.Get(legacyDeviceIDHeader)
+	return r.Header.Get(siloDeviceIDHeader)
 }

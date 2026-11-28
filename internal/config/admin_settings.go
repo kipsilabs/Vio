@@ -421,6 +421,17 @@ const ServerLocalURLSettingKey = "server.local_url"
 // Read per request, so a change applies without restart.
 const WebMediaURLSettingKey = "server.web_media_url"
 
+// The range of auth.password_min_length: never below the built-in minimum,
+// and never above the 72-byte bcrypt limit a password must also fit.
+const (
+	PasswordMinLengthFloor   = 8
+	PasswordMinLengthCeiling = 72
+)
+
+// ServerPublicURLSettingKey is the server's public URL. OAuth sign-in needs
+// it, so turning local password sign-in off reads it too.
+const ServerPublicURLSettingKey = "server.public_url"
+
 // External sign-in settings (docs/architecture/external-sign-in.md).
 const (
 	// AuthLocalPasswordLoginSettingKey turns local password sign-in on or off
@@ -442,6 +453,15 @@ const (
 	// creates keys. Turning it off stops new keys and leaves existing ones
 	// working until they are revoked.
 	AuthUserAPIKeysSettingKey = "auth.user_api_keys" //nolint:gosec // A setting name, not a credential.
+	// AuthPasswordMinLengthSettingKey is the fewest characters a new local
+	// password may have, from PasswordMinLengthFloor to PasswordMinLengthCeiling.
+	AuthPasswordMinLengthSettingKey = "auth.password_min_length"
+	// AuthPasswordRequireUppercaseSettingKey asks a new local password for a
+	// capital letter.
+	AuthPasswordRequireUppercaseSettingKey = "auth.password_require_uppercase"
+	// AuthPasswordRequireSpecialSettingKey asks a new local password for a
+	// punctuation mark or symbol.
+	AuthPasswordRequireSpecialSettingKey = "auth.password_require_special"
 	// AuthProviderRecheckIntervalSettingKey is how old an identity's last
 	// provider check may be before a session refresh asks the provider again.
 	AuthProviderRecheckIntervalSettingKey = "auth.provider_recheck_interval"
@@ -560,6 +580,9 @@ var adminSettingDefaults = map[string]string{
 	AuthLocalPasswordLoginSettingKey:          "true",
 	AuthEmailAutoMatchSettingKey:              "false",
 	AuthUserAPIKeysSettingKey:                 "false",
+	AuthPasswordMinLengthSettingKey:           strconv.Itoa(PasswordMinLengthFloor),
+	AuthPasswordRequireUppercaseSettingKey:    "false",
+	AuthPasswordRequireSpecialSettingKey:      "false",
 	AuthProviderRecheckIntervalSettingKey:     "12h",
 	AuthProviderRecheckOutagePolicySettingKey: AuthRecheckFailOpen,
 
@@ -704,8 +727,6 @@ var adminSettingDefaults = map[string]string{
 	"email.smtp_security": "starttls",
 	"email.from_name":     "Vio",
 
-	"notifications.release_events_enabled":                     "true",
-	"notifications.fanout_enabled":                             "true",
 	"notifications.ui_enabled":                                 "true",
 	"notifications.fanout.settle_seconds":                      "30",
 	"notifications.fanout.max_series_burst":                    "3",
@@ -926,7 +947,7 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		"email.enabled", "signup.enabled", "password_reset.self_service_enabled", SetupCompletedSettingKey,
 		"scanner.empty_trash_after_scan", "scanner.realtime_monitoring", "matcher.enable_tv_series_root_queue",
 		"matcher.enable_tv_series_group_queue", "policy.editor_enabled",
-		"overlays.enabled", "notifications.release_events_enabled", "notifications.fanout_enabled",
+		"overlays.enabled",
 		"notifications.ui_enabled", "notifications.webhooks_enabled",
 		"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
 		"notifications.email_enabled",
@@ -952,6 +973,8 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 			return "", fmt.Errorf("%s must be a 24-hour time such as 04:00", key)
 		}
 		return fmt.Sprintf("%02d:%02d", hour, minute), nil
+	case AuthPasswordMinLengthSettingKey:
+		return normalizeAdminInt(key, value, PasswordMinLengthFloor, PasswordMinLengthCeiling)
 	case BackupKeepSettingKey:
 		return normalizeAdminInt(key, value, MinBackupKeep, MaxBackupKeep)
 	case BackupDestinationSettingKey:

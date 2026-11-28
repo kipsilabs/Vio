@@ -696,7 +696,7 @@ func isEmbyFavoriteRemovedEvent(eventName string) bool {
 }
 
 func containsEmbyFavoriteToken(eventName string) bool {
-	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite") //nolint:misspell // Emby's British-spelling variant.
+	return strings.Contains(eventName, "favorite") || strings.Contains(eventName, "favourite") //nolint:misspell // provider event spelling.
 }
 
 func actionAllowsSeries(action string) bool {

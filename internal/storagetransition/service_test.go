@@ -214,8 +214,6 @@ func (s *fencedMemoryStore) BeginMutationFence(context.Context) (func(), error) 
 	}, nil
 }
 
-func (s *fencedMemoryStore) MutationsFenced() bool { return s.fenced }
-
 type aliasStore struct {
 	*memoryStore
 	backing   map[string][]byte

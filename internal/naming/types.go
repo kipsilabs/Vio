@@ -56,10 +56,4 @@ type VariantHints struct {
 	PresentationPartIndex int
 	MultiEpisodeStart     int
 	MultiEpisodeEnd       int
-	// ReleaseName is the file's stem (basename without extension), the closest
-	// the server gets to the release's advertised name.
-	ReleaseName string
-	// ReleaseGroup is the trailing group tag on release-style names
-	// ("Movie.2023.2160p.AltMount" → "AltMount"), "" when none is present.
-	ReleaseGroup string
 }

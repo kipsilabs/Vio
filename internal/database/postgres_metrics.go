@@ -129,7 +129,7 @@ type postgresPoolCollector struct {
 
 var postgresPools = &postgresPoolCollector{
 	pools:       make(map[weak.Pointer[pgxpool.Pool]]string),
-	connections: prometheus.NewDesc("vio_postgres_pool_connections", "Connections in live PostgreSQL pools by role and state; maximum is configured capacity.", []string{"role", "state"}, nil),
+	connections: prometheus.NewDesc("silo_postgres_pool_connections", "Connections in live PostgreSQL pools by role and state; maximum is configured capacity.", []string{"role", "state"}, nil),
 }
 
 func init() { prometheus.MustRegister(postgresPools) }

@@ -59,10 +59,7 @@ scale; so does a title rated only "NR" in the US. The parental-control path
 keeps to the US rating.
 
 When TMDB cannot answer, the request is still created from the client's copy,
-and the facts stay uncaptured until routing fetches them. The deferred step
-records nothing on a failed read rather than an empty snapshot, so submission
-and routing retry through their backfill paths instead of routing on a title
-with no facts.
+and the facts stay uncaptured until routing fetches them.
 
 ## Routing
 
@@ -263,14 +260,6 @@ reconcile pass on every server all go through the claim, so a request is never
 submitted twice at once. The claim is a lease: if the claiming server dies
 mid-call, the reconcile pass picks the request up after the lease.
 
-An auto-approved create commits the approval and returns the approved request
-before the submission runs. The submission is scheduled after the response
-through the same claim, so a slow router or a cold metadata lookup cannot hold
-the `POST /api/v2/requests` response open. The response therefore reports
-`approved`; the later `queued` or `completed` state, or a failure's
-`last_error` and retry time, appears on the request's next read. Validation
-refusals stay synchronous with the create.
-
 A failed attempt keeps the approval. It records `last_error`, releases the lease,
 schedules the next attempt in `next_submit_at` (5 minutes, doubling to an hour),
 and answers the caller with
@@ -299,12 +288,10 @@ remaining targets decide the status.
 
 A series request names the seasons it wants (`seasons`). Season numbers start
 at 1: a request naming season 0 (specials) or a negative number is refused with
-`validation_failed`, never read as naming none. When the requester names none,
-the server asks for every aired regular season (the series metadata provider's
-seasons that have started airing, specials excluded) that is not complete in
-the library, preferring TVDB when available and falling back to TMDB. Request
-validation and defaults use the same season source the detail page shows.
-Requests from before season requests, including every request made through the retired `/api/v1` routes, have no seasons:
+`validation_failed`, never read as naming none. When the requester names none, the server asks for every aired regular season (TMDB's seasons that
+have started airing, specials excluded) that is not complete in the library.
+Requests from before season requests, including every request made through
+the retired `/api/v1` routes, have no seasons:
 they mean the whole series and keep the old rule that any episode in the
 library fulfills them. A series with no aired season yet, and not in the
 library, is requested whole unless the requester names seasons.
@@ -356,19 +343,21 @@ episode of it is present.
 
 A season request is fulfilled, completed by the reconcile pass and notified,
 when every requested season is complete; while only some are, its state is
-`partially_available`. Once the download server reports the request done, a
-season also counts when any episode of it is present: an episode the server
-cannot find would otherwise hold the request and its notification open for
-good. A season with no episode in the library never counts, since it may not
-have aired yet. The request path now prefers TVDB seasons and falls back to
-TMDB, so a TVDB-numbered library and its request page use the same numbering
-when TVDB is available. A library whose metadata provider still numbers seasons
-differently from the request path's source (absolute order, or TVDB order when
-only TMDB seasons are available) can therefore leave a season request waiting;
-the fulfilled-notification pass stamps each request it checks without
-notifying, so such requests rotate behind newer ones rather than starve them.
-Season numbers already stored on a request are not renumbered when this source
-changes: a request created under TMDB numbering keeps the numbers it stored.
+`partially_available`. A router plugin's report that a target is done does not
+complete a season request by itself: a plugin may answer for the whole series
+(Seerr's AVAILABLE does), so the target keeps its status, with the plugin's raw
+status recorded, until every requested season is complete. A series the
+library does not have, or a library that cannot report seasons, keeps it open.
+Once a request is completed, a season also counts when any episode of it is
+present: an episode the server cannot find would otherwise hold its
+notification open for good. A season with no episode in the library never
+counts, since it may not have aired yet. A library whose metadata provider
+numbers seasons differently from TMDB (absolute or TVDB order), or an aired
+episode the download server never finds, therefore keeps a season request in
+progress, and no other request for the title can be made while it is open. A
+completed request can still wait on its seasons for its notification; the
+fulfilled-notification pass stamps each request it checks without notifying,
+so such requests rotate behind newer ones rather than starve them.
 
 The series detail lists each regular season with its availability (`missing`,
 `partial`, `available`) and whether the active request covers it. A title still

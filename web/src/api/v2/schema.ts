@@ -6865,7 +6865,7 @@ export interface paths {
     put?: never;
     /**
      * Redeem the one-time code an OAuth callback issued for the token pair.
-     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the vio_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
+     * @description A code is valid for 60 seconds and redeems once. The login session opens at redemption, so a code that is never redeemed leaves no session. Redeeming a used code again revokes the session its redemption opened. A native code needs the code_verifier of its S256 challenge. A web code takes none and redeems only in the browser the callback answered, which holds the silo_oauth_complete cookie, so a code passed to another browser cannot sign that browser in.
      */
     post: operations["completeOAuthLogin"];
     delete?: never;
@@ -16201,55 +16201,126 @@ export interface components {
       size_bytes: number;
     };
     AdminCgroupCPUStats: {
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total cgroup CPU bandwidth enforcement periods elapsed.
+       */
       periods?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Linux PSI cpu some avg10 percentage (10-second average).
+       */
       pressure_some_pct?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Effective CPU quota in cores at the selected cgroup level (may reflect a tighter cpuset); omitted when unlimited.
+       */
       quota_cores?: number;
+      /** @description Selected visible cgroup level: leaf or ancestor (an ancestor includes sibling workloads); new values may appear. */
       scope: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Enforcement periods during which the cgroup was CPU-throttled.
+       */
       throttled_periods?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Cumulative CPU time spent throttled by cgroup bandwidth limits in seconds.
+       */
       throttled_seconds?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Cumulative CPU time consumed by the selected cgroup in seconds.
+       */
       usage_seconds?: number;
+      /** @description Cgroup hierarchy version: v1 or v2; new values may appear. */
       version: string;
     };
     AdminCgroupMemoryStats: {
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total memory charged to the selected cgroup in bytes, including page cache. In all-in-one containers this includes co-resident services such as bundled Postgres or Redis.
+       */
       current_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Count of memory.high throttle events on cgroup v2.
+       */
       high_events?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Concrete memory limit of the selected cgroup in bytes; omitted when unlimited.
+       */
       limit_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Count of memory.max (v2) or failcnt (v1) limit-hit events.
+       */
       max_events?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Count of cgroup OOM events.
+       */
       oom_events?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Count of processes killed by the cgroup OOM killer.
+       */
       oom_kills?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Linux PSI memory full avg10 percentage (10-second average).
+       */
       pressure_full_pct?: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Linux PSI memory some avg10 percentage (10-second average).
+       */
       pressure_some_pct?: number;
+      /** @description Selected visible cgroup level: leaf or ancestor (an ancestor includes sibling workloads); new values may appear. */
       scope: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Swap usage of the selected cgroup in bytes.
+       */
       swap_bytes?: number;
+      /** @description Cgroup hierarchy version: v1 or v2; new values may appear. */
       version: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Selected cgroup memory charge minus inactive file pages in bytes; closest single figure for container memory use, though an ancestor scope includes sibling workloads and it is not an exact OOM predictor.
+       */
       working_set_bytes?: number;
     };
     AdminChildStats: {
-      /** Format: double */
+      /**
+       * Format: double
+       * @description CPU of live owned FFmpeg children over the last sample window, on the same scale and capacity as system.cpu_pct. A lower bound: a child's last partial window and a child that starts and exits between two samples are missed. Omitted when the window was not measured, including a truncated pass.
+       */
+      cpu_pct?: number;
+      /**
+       * Format: double
+       * @description Summed lifetime CPU seconds of currently live owned child processes. Decreases when a child exits; do not diff as a monotonic counter.
+       */
       cpu_seconds: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Summed resident memory (RSS) in bytes across sampled live owned child processes (transcodes, remuxes, media analysis, trickplay and chapter thumbnails); may count shared pages more than once.
+       */
       resident_bytes: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Live owned child processes successfully read in this sample.
+       */
       sampled: number;
+      /** @description True when more live owned child processes existed than the per-sample cap (256). */
       truncated: boolean;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Live owned child processes whose /proc entries could not be read.
+       */
       unavailable: number;
+      /** @description Owned child workload sampled (for example ffmpeg); new values may appear. */
       workload: string;
     };
     AdminCollection: {
@@ -17312,22 +17383,39 @@ export interface components {
       state: "pending" | "ready" | "empty" | "error";
     };
     AdminDiskDetails: {
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total inodes on the filesystem.
+       */
       inodes_total?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Inodes currently allocated on the filesystem.
+       */
       inodes_used?: number;
+      /** @description Mount role matching the corresponding system.disks entry (scratch or library-N). */
       role: string;
     };
     AdminDiskStats: {
       /** @description Where the mount is; omitted for scoped API keys */
       path?: string;
+      /** @description Mount role: scratch for the transcode working directory, or library-N positionally for each media root. */
       role?: string;
+      /** @description True for the transcode working directory mount (at most one entry per sample). */
       scratch?: boolean;
+      /** @description True when the mount's last probe did not finish in time and this reading is carried forward. */
       stale?: boolean;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Usable filesystem capacity in GiB (bytes used plus bytes available to this process, excluding blocks reserved for root).
+       */
       total_gb: number;
+      /** @description True when the mount has never been measured successfully; used_gb and total_gb are meaningless when true. */
       unavailable?: boolean;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Used space on the filesystem in GiB (bytes divided by 1024^3).
+       */
       used_gb: number;
     };
     AdminDownloadDevice: {
@@ -18106,20 +18194,41 @@ export interface components {
       value: string;
     };
     AdminGPUStats: {
+      /** @description Render device path (for example /dev/dri/renderD128) or CUDA index/UUID when no DRM render node is visible. */
       device: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Render/3D engine busy percentage when reported; omitted when not measurable.
+       */
       render_busy_pct?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Active hardware-accelerated sessions attributed to this GPU.
+       */
       sessions: number;
+      /** @description Measurement source (fdinfo, nvidia-smi, fdinfo+nvidia-smi, unavailable); new values may appear. */
       source: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Overall GPU busy percentage when reported; omitted when not measurable.
+       */
       total_busy_pct?: number;
+      /** @description GPU vendor (for example nvidia, intel, amd); new values may appear. */
       vendor?: string;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Video engine busy percentage when reported; omitted when not measurable.
+       */
       video_busy_pct?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total GPU memory in MiB when reported; omitted when not measurable.
+       */
       vram_total_mb?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description GPU memory in use in MiB when reported; omitted when not measurable.
+       */
       vram_used_mb?: number;
     };
     AdminGroups: {
@@ -20809,27 +20918,65 @@ export interface components {
       source: string;
     };
     AdminProcessStats: {
-      /** Format: double */
+      /**
+       * Format: double
+       * @description This process's CPU over the last sample window, on the same scale and capacity as system.cpu_pct. Omitted when the window was not measured; a measured idle process is 0.
+       */
+      cpu_pct?: number;
+      /**
+       * Format: double
+       * @description Cumulative CPU time consumed by this Silo process in seconds (user + system).
+       */
       cpu_seconds?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total memory mapped by the Go runtime in bytes; this is a runtime reservation, not RSS.
+       */
       go_memory_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Live goroutine count in this Silo process.
+       */
       goroutines?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Marked live Go heap after the last GC cycle in bytes (subset of resident_bytes; subtracting from RSS does not yield exact native allocations).
+       */
       heap_live_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Soft file-descriptor limit (RLIMIT_NOFILE) of this Silo process.
+       */
       max_fds?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Open file descriptors held by this Silo process.
+       */
       open_fds?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Cumulative storage bytes read from /proc/PID/io; on Linux this includes I/O attributed to waited-for children.
+       */
       read_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Resident set size (RSS) of this Silo server process alone in bytes; excludes FFmpeg children and separate database/cache processes.
+       */
       resident_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description OS thread count of this Silo process.
+       */
       threads?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Virtual memory size of this Silo process in bytes.
+       */
       virtual_bytes?: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Cumulative storage bytes written from /proc/PID/io; on Linux this includes I/O attributed to waited-for children.
+       */
       write_bytes?: number;
     };
     AdminRateLimitAuthEndpoint: {
@@ -21589,31 +21736,56 @@ export interface components {
       window_start: string;
     };
     AdminResourceAttribution: {
+      /** @description Visible cgroup CPU usage, quota, throttling, and pressure; omitted when unavailable. */
       cgroup_cpu?: components["schemas"]["AdminCgroupCPUStats"];
+      /** @description Visible cgroup memory usage, limit, events, and pressure; omitted when unavailable. Overlaps with process and children; do not add them together. */
       cgroup_memory?: components["schemas"]["AdminCgroupMemoryStats"];
+      /** @description Bounded point-in-time snapshot of live owned FFmpeg children; omitted when unavailable. Overlaps with cgroup_memory; do not add to cgroup_memory. */
       children?: components["schemas"]["AdminChildStats"];
+      /** @description Scope, source, and availability of system.cpu_pct and system.cores. */
       cpu: components["schemas"]["AdminResourceSource"];
+      /** @description Inode counts keyed by disk role, carrying the matching system.disks entry's freshness; omitted when none. */
       disks?: components["schemas"]["AdminDiskDetails"][];
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Configured media roots beyond the bounded disk sampling cap that were not probed.
+       */
       dropped_disk_roots: number;
+      /** @description Random identifier for this sampler lifetime; identifies which process answered behind a load balancer without exposing a hostname. */
       instance_id: string;
+      /** @description Scope, source, and availability of system.load1. */
       load: components["schemas"]["AdminResourceSource"];
+      /** @description Scope, source, and availability of system.mem_used_mb and system.mem_total_mb. */
       memory: components["schemas"]["AdminResourceSource"];
+      /** @description Scope, source, and availability of system.net_rx_bps and system.net_tx_bps. */
       network: components["schemas"]["AdminResourceSource"];
+      /** @description Resource usage of this Silo process alone. Overlaps with children and cgroup_memory; do not add them together. */
       process?: components["schemas"]["AdminProcessStats"];
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Wall-clock duration of the last completed sampling pass in seconds.
+       */
       sample_duration_seconds: number;
-      /** Format: double */
+      /**
+       * Format: double
+       * @description Configured sampling cadence in seconds.
+       */
       sample_interval_seconds: number;
     };
     AdminResourceCapabilities: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
+      /** @description Responses may include attribution.cgroup_cpu and attribution.cgroup_memory. */
       cgroup_resources: boolean;
+      /** @description Responses include attribution.instance_id and per-metric scope and source metadata. */
       instance_attribution: boolean;
+      /** @description Responses may include attribution.process.cpu_pct and attribution.children.cpu_pct. */
+      process_cpu_percent: boolean;
+      /** @description Responses may include attribution.process and attribution.children. */
       process_resources: boolean;
       /** @description Opaque revision of this document */
       revision: string;
+      /** @description Responses include sampled_at, stale, and attribution sample interval and duration. */
       sample_freshness: boolean;
       /**
        * @description Support and configuration state, not health
@@ -21622,8 +21794,11 @@ export interface components {
       state: "available" | "disabled" | "not_configured" | "unsupported";
     };
     AdminResourceSource: {
+      /** @description True when the corresponding system reading was measured in this sample. */
       available: boolean;
+      /** @description Population measured: host, virtualized_host, cgroup, or network_namespace; new values may appear. */
       scope: string;
+      /** @description Operating-system source: procfs, lxcfs, cgroup_v1, or cgroup_v2; new values may appear. */
       source: string;
     };
     AdminRestartKeys: {
@@ -22210,32 +22385,59 @@ export interface components {
       username?: string;
     };
     AdminSystemResources: {
+      /** @description Scope and source of each system reading, plus process, cgroup, and owned FFmpeg child detail; omitted when none is reported. */
       attribution?: components["schemas"]["AdminResourceAttribution"];
+      /** @description True when this host can be sampled. False on non-Linux hosts, before the first sample completes, or without a sampler; do not read false as zero load. */
       available: boolean;
+      /** @description One entry per visible GPU, always an array. Missing measurements are omitted while a measured zero remains zero. */
       gpu: components["schemas"]["AdminGPUStats"][];
       /**
        * Format: date-time
-       * @description RFC 3339 instant in UTC with millisecond precision
+       * @description When the sample was taken; omitted when no sample exists.
        */
       sampled_at?: string;
+      /** @description True when no sample exists or its age exceeds three sampling intervals. */
       stale: boolean;
+      /** @description Host or cgroup CPU, memory, load, disk, and network sample; omitted when unavailable. */
       system?: components["schemas"]["AdminSystemStats"];
     };
     AdminSystemStats: {
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description CPUs available to this process: cgroup CPU quota rounded up when limited, otherwise all CPUs the kernel reports.
+       */
       cores: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Aggregate busy percentage across available cores over the last sampling interval (0-100; idle and iowait count as not busy). Uses cgroup usage against cgroup quota when a CPU limit binds; attribution.cpu reports which.
+       */
       cpu_pct: number;
+      /** @description Sampled mounts (transcode scratch first, then library roots), deduplicated by filesystem and bounded. */
       disks: components["schemas"]["AdminDiskStats"][];
-      /** Format: double */
+      /**
+       * Format: double
+       * @description 1-minute load average, including tasks blocked on storage I/O. Always host-wide (or lxcfs-virtualized); read relative to cores.
+       */
       load1: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Total memory capacity in MiB, from the same host or cgroup domain as mem_used_mb.
+       */
       mem_total_mb: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Memory in use in MiB. Matches the cgroup working set when a concrete memory limit binds, otherwise the host; paired with mem_total_mb from the same domain (see attribution.memory).
+       */
       mem_used_mb: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Aggregate received network throughput in bits per second, excluding loopback. Covers Silo's network namespace (container interfaces under bridge Docker, or host NICs), not streaming traffic alone; use GET /api/v2/admin/stats/timeseries for Silo viewer egress.
+       */
       net_rx_bps: number;
-      /** Format: int64 */
+      /**
+       * Format: int64
+       * @description Aggregate transmitted network throughput in bits per second, excluding loopback. Covers Silo's network namespace (all traffic, not streaming alone); use GET /api/v2/admin/stats/timeseries for Silo viewer egress.
+       */
       net_tx_bps: number;
     };
     AdminTask: {
@@ -26622,6 +26824,7 @@ export interface components {
       /** @enum {string} */
       feature:
         | "direct"
+        | "engine"
         | "nat_mapping"
         | "nat_hairpin"
         | "ipv4"
@@ -26652,7 +26855,14 @@ export interface components {
         | "no_gateway"
         | "gateway_unsupported"
         | "mapping_varies"
-        | "not_measured";
+        | "not_measured"
+        | "multiple_api_replicas"
+        | "replica_census_unavailable"
+        | "replica_lease_pending"
+        | "replica_lease_held"
+        | "udp_port_invalid"
+        | "udp_port_bind_failed"
+        | "engine_start_failed";
       requested?: string;
       /** @enum {string} */
       state: "on" | "off" | "capped" | "fallback" | "degraded" | "unknown";
@@ -26673,6 +26883,8 @@ export interface components {
       default: string;
       effective: string;
       env: string;
+      max?: string;
+      min?: string;
       reason?: string;
       requested?: string;
     };
@@ -43549,7 +43761,7 @@ export interface operations {
         cursor?: string;
         limit?: number;
         q?: string;
-        status?: "" | "accepted" | "running" | "completed" | "failed" | "canceled" | "cancelled";
+        status?: "" | "accepted" | "running" | "completed" | "failed" | "cancelled" | "canceled";
       };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
@@ -98711,6 +98923,8 @@ export interface operations {
       path?: never;
       cookie?: {
         /** @description Completion cookie the callback set in the browser it sent to the web completion page (HttpOnly, path-scoped to this operation, two minutes). The browser sends it by itself; a web code redeemed without it, or with another browser's, is 400 invalid_grant and stays redeemable. Native codes ignore it */
+        silo_oauth_complete?: string;
+        /** @description Deprecated completion cookie name; accepted during the transition */
         vio_oauth_complete?: string;
       };
     };

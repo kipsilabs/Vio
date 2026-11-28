@@ -177,6 +177,9 @@ func VariantWidthPx(variant string) (int, bool) {
 	}
 	return width, true
 }
+
+// FromRequest reads the requested size from the query string, for handlers
+// that answer artwork at a caller-chosen width.
 func FromRequest(r *http.Request) (Size, error) {
 	if r == nil || r.URL == nil {
 		return Unset, nil

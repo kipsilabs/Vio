@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/pathscope"
 )
 
 const (
@@ -34,7 +35,6 @@ func NewSkippedRootRepository(pool *pgxpool.Pool) *SkippedRootRepository {
 
 const skippedRootColumns = `media_folder_id, root_path, reason, sample_file_path, file_count, first_seen_at, last_seen_at`
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func scanSkippedRoot(row pgx.Row) (*models.SkippedMediaRoot, error) {
 	var root models.SkippedMediaRoot
 	if err := row.Scan(
@@ -109,6 +109,8 @@ func (r *SkippedRootRepository) Upsert(ctx context.Context, root models.SkippedM
 // 34-episode pack converges on file_count=34 instead of overwriting it with
 // each caller's partial count.
 func (r *SkippedRootRepository) UpsertObservedFile(ctx context.Context, folderID int, rootPath, reason, sampleFilePath string) error {
+	cleanRoot := filepath.Clean(rootPath)
+	lower, upper := pathscope.DescendantRange(cleanRoot)
 	query := `
 		INSERT INTO skipped_media_roots (
 			media_folder_id, root_path, reason, sample_file_path, file_count, first_seen_at, last_seen_at
@@ -119,7 +121,8 @@ func (r *SkippedRootRepository) UpsertObservedFile(ctx context.Context, folderID
 				FROM media_files mf
 				WHERE mf.media_folder_id = $1
 				  AND mf.missing_since IS NULL
-				  AND strpos(mf.file_path, $2 || '/') = 1
+				  AND mf.file_path ~>=~ $5
+				  AND mf.file_path ~<~ $6
 			)),
 			NOW(), NOW())
 		ON CONFLICT (media_folder_id, root_path) DO UPDATE
@@ -128,7 +131,7 @@ func (r *SkippedRootRepository) UpsertObservedFile(ctx context.Context, folderID
 			file_count = EXCLUDED.file_count,
 			last_seen_at = NOW()
 	`
-	_, err := r.pool.Exec(ctx, query, folderID, filepath.Clean(rootPath), reason, sampleFilePath)
+	_, err := r.pool.Exec(ctx, query, folderID, cleanRoot, reason, sampleFilePath, lower, upper)
 	if err != nil {
 		return fmt.Errorf("upserting observed skipped media root: %w", err)
 	}

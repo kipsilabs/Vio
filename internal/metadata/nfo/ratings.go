@@ -21,10 +21,10 @@ const (
 )
 
 // nfoRatingName is what a <rating name> maps to: the rating source and the
-// top of its scale when the entry omits max.
+// top of its scale when the entry omits maxValue.
 type nfoRatingName struct {
-	source string
-	max    float64
+	source   string
+	maxValue float64
 }
 
 // nfoRatingNames maps lower-cased <rating name> spellings to rating sources.
@@ -72,13 +72,13 @@ func applyRatingValues(p *parsedNFO, in nfoRatingInput) {
 		if !known || !ok {
 			continue
 		}
-		// An explicit max attribute always wins over the source's default
+		// An explicit maxValue attribute always wins over the source's default
 		// scale; a bare RT score (tomatometer 60) is out of 100, not 10.
-		scale := spec.max
+		maxValue := spec.maxValue
 		if parsed, parsedOK := parseRatingValue(r.Max); parsedOK {
-			scale = parsed
+			maxValue = parsed
 		}
-		p.setRating(spec.source, value, scale, parseVotes(r.Votes))
+		p.setRating(spec.source, value, maxValue, parseVotes(r.Votes))
 	}
 	if len(in.block.Ratings) == 0 {
 		if value, ok := parseRatingValue(in.legacy); ok {
@@ -91,26 +91,26 @@ func applyRatingValues(p *parsedNFO, in nfoRatingInput) {
 	// <userrating> is intentionally not emitted; see parsedNFO.
 }
 
-// setRating records value (out of max) for source unless the file already
+// setRating records value (out of maxValue) for source unless the file already
 // gave it one: the headline slot for IMDb, TMDB, and Rotten Tomatoes, and the
 // per-source row with its votes on 0-100.
-func (p *parsedNFO) setRating(source string, value, scale float64, votes int64) {
+func (p *parsedNFO) setRating(source string, value, maxValue float64, votes int64) {
 	if _, exists := p.RatingSources[source]; exists {
 		return
 	}
 	if p.RatingSources == nil {
 		p.RatingSources = make(map[string]metadata.RatingSource)
 	}
-	p.RatingSources[source] = metadata.RatingSource{Score: scaleRating(value, scale, 100), Votes: votes}
+	p.RatingSources[source] = metadata.RatingSource{Score: scaleRating(value, maxValue, 100), Votes: votes}
 	switch source {
 	case models.RatingSourceIMDB:
-		p.RatingIMDB = scaleRating(value, scale, 10)
+		p.RatingIMDB = scaleRating(value, maxValue, 10)
 	case models.RatingSourceTMDB:
-		p.RatingTMDB = scaleRating(value, scale, 10)
+		p.RatingTMDB = scaleRating(value, maxValue, 10)
 	case models.RatingSourceRTCritic:
-		p.RatingRTCritic = scaleRating(value, scale, 100)
+		p.RatingRTCritic = scaleRating(value, maxValue, 100)
 	case models.RatingSourceRTAudience:
-		p.RatingRTAudience = scaleRating(value, scale, 100)
+		p.RatingRTAudience = scaleRating(value, maxValue, 100)
 	}
 }
 
@@ -140,13 +140,13 @@ func parseVotes(raw string) int64 {
 	return votes
 }
 
-func scaleRating(value, scale, targetScale float64) float64 {
-	if scale <= 0 {
-		scale = targetScale
+func scaleRating(value, maxValue, targetMax float64) float64 {
+	if maxValue <= 0 {
+		maxValue = targetMax
 	}
-	scaled := value * targetScale / scale
-	if scaled > targetScale {
-		return targetScale
+	scaled := value * targetMax / maxValue
+	if scaled > targetMax {
+		return targetMax
 	}
 	return scaled
 }

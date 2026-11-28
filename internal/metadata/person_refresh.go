@@ -224,7 +224,7 @@ func (s *PersonRefreshService) refreshPersonSince(
 // started after it. resolve supplies the providers once the attempt is
 // recorded, so a failure to resolve them is a failed lookup that backs off
 // like any other.
-func (s *PersonRefreshService) refreshPerson( //nolint:funlen,gocyclo // upstream refreshPerson exceeds Vio's 100-line and complexity-30 limits; refactor tracked separately
+func (s *PersonRefreshService) refreshPerson( //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	ctx context.Context,
 	id int64,
 	resolve func(context.Context) ([]Provider, error),
@@ -464,7 +464,6 @@ func (s *PersonRefreshService) enqueuePersonPhoto(ctx context.Context, person mo
 	}
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
 func (s *PersonRefreshService) cachePersonPhoto(
 	ctx context.Context,
 	person models.Person,

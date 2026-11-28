@@ -156,7 +156,7 @@ func (d *EventDispatcher) deliverDue(ctx context.Context) {
 			d.claimAndDeliver(ctx)
 			d.inflight.Wait()
 		}
-		time.Sleep(time.Millisecond) //nolint:forbidigo // Polls the dispatcher's in-flight work.
+		time.Sleep(time.Millisecond) //nolint:forbidigo // upstream test waits on observable state with a bounded sleep
 	}
 }
 

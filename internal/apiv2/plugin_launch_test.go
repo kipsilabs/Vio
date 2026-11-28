@@ -52,7 +52,7 @@ func TestPluginLaunchCookieScopeAndAttributes(t *testing.T) {
 		t.Fatal(rec.Code, rec.Body.String(), f.calls, f.profile)
 	}
 	raw := rec.Header().Get("Set-Cookie")
-	want := "^vio_plugin_access=[^;]+; Path=" + plugins.ContentPrefix + "; Max-Age=300; HttpOnly; SameSite=Lax$"
+	want := "^silo_plugin_access=[^;]+; Path=" + plugins.ContentPrefix + "; Max-Age=300; HttpOnly; SameSite=Lax$"
 	if !regexp.MustCompile(want).MatchString(raw) {
 		t.Fatalf("Set-Cookie = %q, want match %q", raw, want)
 	}

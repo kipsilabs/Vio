@@ -22,19 +22,19 @@ var queueQueries = []struct{ name, sql string }{
 	{workloadNotifications, `SELECT 'queued', count(*), min(created_at) FROM release_events WHERE processed_at IS NULL`},
 	{"matching_movies", `SELECT CASE WHEN lease_token = '' THEN 'queued' ELSE 'running' END, count(*), min(first_queued_at) FROM movie_match_queue WHERE state = 'pending' GROUP BY 1`},
 	{"matching_series", `SELECT CASE WHEN lease_token = '' THEN 'queued' ELSE 'running' END, count(*), min(first_queued_at) FROM series_root_match_queue WHERE state = 'pending' GROUP BY 1`},
-	{workloadImages, `SELECT status, count(*), min(created_at) FROM metadata_image_cache_jobs WHERE status IN ('queued','running') GROUP BY status`},
+	{workloadImages, `SELECT status, count(*), CASE WHEN status = 'queued' THEN min(next_attempt_at) FILTER (WHERE next_attempt_at <= NOW()) ELSE min(created_at) END FROM metadata_image_cache_jobs WHERE status IN ('queued','running') GROUP BY status`},
 	{"metadata_translation", `SELECT status, count(*), min(created_at) FROM metadata_translation_jobs WHERE status IN ('pending','running') GROUP BY status`},
 	{"autoscan_intake", `SELECT CASE WHEN locked_by = '' THEN 'queued' ELSE 'running' END, count(*), min(received_at) FROM autoscan_webhook_deliveries GROUP BY 1`},
 	{"webhook_delivery", `SELECT 'queued', count(*), min(attempted_at) FROM webhook_delivery_attempts WHERE outcome IN ('pending','retrying')`},
 	{"web_push_delivery", `SELECT 'queued', count(*), min(attempted_at) FROM web_push_delivery_attempts WHERE outcome IN ('pending','retrying')`},
 	{"native_push_delivery", `SELECT 'queued', count(*), min(created_at) FROM push_delivery_attempts WHERE outcome IN ('pending','retrying')`},
 }
-var queueDepthDesc = prometheus.NewDesc("vio_queue_items", "Shared durable queue items; aggregate replicas with max, not sum. Queued includes delayed retries.", []string{labelQueue, "state"}, nil)
-var queueOldestDesc = prometheus.NewDesc("vio_queue_oldest_requested_timestamp_seconds", "Oldest request timestamp by shared queue state; absent when empty or unavailable.", []string{labelQueue, "state"}, nil)
-var queueSampleDesc = prometheus.NewDesc("vio_queue_sample_timestamp_seconds", "Last successful shared queue sample. Samples older than 90 seconds are omitted.", []string{labelQueue}, nil)
-var queueAvailableDesc = prometheus.NewDesc("vio_queue_sample_available", "Whether the last queue query succeeded and its sample is fresh.", []string{labelQueue}, nil)
-var queueErrorsDesc = prometheus.NewDesc("vio_queue_sample_errors_total", "Background queue query failures; no raw error strings are exported.", []string{labelQueue}, nil)
-var queueDurationDesc = prometheus.NewDesc("vio_queue_sample_duration_seconds", "Wall time of the last background queue query including pool wait.", []string{labelQueue}, nil)
+var queueDepthDesc = prometheus.NewDesc("silo_queue_items", "Shared durable queue items; aggregate replicas with max, not sum. Queued includes delayed retries.", []string{labelQueue, "state"}, nil)
+var queueOldestDesc = prometheus.NewDesc("silo_queue_oldest_requested_timestamp_seconds", "Oldest request timestamp by shared queue state (oldest due timestamp for queued images); absent when empty, nothing is due, or unavailable.", []string{labelQueue, "state"}, nil)
+var queueSampleDesc = prometheus.NewDesc("silo_queue_sample_timestamp_seconds", "Last successful shared queue sample. Samples older than 90 seconds are omitted.", []string{labelQueue}, nil)
+var queueAvailableDesc = prometheus.NewDesc("silo_queue_sample_available", "Whether the last queue query succeeded and its sample is fresh.", []string{labelQueue}, nil)
+var queueErrorsDesc = prometheus.NewDesc("silo_queue_sample_errors_total", "Background queue query failures; no raw error strings are exported.", []string{labelQueue}, nil)
+var queueDurationDesc = prometheus.NewDesc("silo_queue_sample_duration_seconds", "Wall time of the last background queue query including pool wait.", []string{labelQueue}, nil)
 
 type queueState struct {
 	count  float64

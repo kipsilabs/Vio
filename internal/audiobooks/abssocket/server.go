@@ -87,7 +87,7 @@ func New(secretFn SecretFn, tokenValidator TokenValidator, logger Logger, opts *
 		tokenValidator: tokenValidator,
 		logger:         logger,
 	}
-	_ = io.On("connection", func(args ...any) {
+	if err := io.On("connection", func(args ...any) {
 		if len(args) == 0 {
 			return
 		}
@@ -96,7 +96,9 @@ func New(secretFn SecretFn, tokenValidator TokenValidator, logger Logger, opts *
 			return
 		}
 		s.onConnection(client)
-	})
+	}); err != nil {
+		logger.Warn("abssocket: register connection handler", "err", err)
+	}
 	return s
 }
 
@@ -114,7 +116,7 @@ func (s *Server) onConnection(client *socket.Socket) {
 	// successful auth fires "init" with a user-state payload; failed auth
 	// fires "auth_failed" with {message}. The official ABS mobile + web
 	// clients listen for these specific names.
-	_ = client.On("auth", func(args ...any) {
+	if err := client.On("auth", func(args ...any) {
 		token := pickToken(args)
 		if token == "" {
 			s.logger.Warn("abssocket: auth without token", "sid", client.Id())
@@ -153,16 +155,22 @@ func (s *Server) onConnection(client *socket.Socket) {
 			"userId":      claims.UserID,
 			"connectedAt": time.Now().UnixMilli(),
 		})
-	})
+	}); err != nil {
+		s.logger.Warn("abssocket: register auth handler", "sid", client.Id(), "err", err)
+		client.Disconnect(true)
+		return
+	}
 
-	_ = client.On("disconnect", func(...any) {
+	if err := client.On("disconnect", func(...any) {
 		s.mu.Lock()
 		if s.connCount > 0 {
 			s.connCount--
 		}
 		s.mu.Unlock()
 		s.logger.Debug("abssocket: connection closed", "sid", client.Id())
-	})
+	}); err != nil {
+		s.logger.Warn("abssocket: register disconnect handler", "sid", client.Id(), "err", err)
+	}
 }
 
 // Handler returns the http.Handler to mount at /socket.io/*.
@@ -177,7 +185,9 @@ func (s *Server) Publish(userID, event string, payload any) {
 	if userID == "" {
 		return
 	}
-	_ = s.io.To(userRoom(userID)).Emit(event, payload)
+	if err := s.io.To(userRoom(userID)).Emit(event, payload); err != nil {
+		s.logger.Warn("abssocket: publish failed", "event", event, "err", err)
+	}
 }
 
 // Broadcast emits to every authenticated socket regardless of user. Use

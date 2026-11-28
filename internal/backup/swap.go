@@ -19,8 +19,14 @@ type ControlDB interface {
 	OID(ctx context.Context, name string) (oid uint32, found bool, err error)
 	// NameOf returns the current name of the database with oid.
 	NameOf(ctx context.Context, oid uint32) (name string, found bool, err error)
-	// OtherConnections counts sessions on name other than this command's.
+	// OtherConnections counts the sessions on name other than this
+	// command's (the control session and connections made under
+	// OwnApplicationName) and autovacuum workers.
 	OtherConnections(ctx context.Context, name string) (int, error)
+	// OwnApplicationName is the application name the restore gives its own
+	// connections to the live database so OtherConnections can leave them
+	// out; empty when the control does not tell them apart.
+	OwnApplicationName() string
 	// CheckPrivileges confirms the role can create and rename databases and
 	// change ALLOW_CONNECTIONS on live.
 	CheckPrivileges(ctx context.Context, live string) error
@@ -74,7 +80,7 @@ type SwapOptions struct {
 	// WorkDir holds the local journal.
 	WorkDir string
 	// Journaled runs once the journal exists, just before the live database
-	// closes, with the time --recover takes from here on.
+	// closes, with the identifier --recover takes from here on.
 	Journaled func(stamp string)
 	Now       func() time.Time
 	Out       io.Writer
@@ -112,7 +118,7 @@ func timedOut(err error) string {
 // before the restored one is verified, keeps the old database and every
 // overwritten blob, and rolls back a failure in the blob or rename steps with
 // the databases closed until the original is whole again.
-func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error { //nolint:funlen // The restore and rollback steps must stay in one ordered sequence.
+func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error { //nolint:funlen,gocyclo // upstream function exceeds Vio's complexity-30 limit; refactor tracked separately
 	out := writerOrDiscard(opts.Out)
 	m := src.Manifest
 	// A database-only backup leaves the live files as they are.
@@ -122,12 +128,28 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 		return err
 	}
 	defer unlock(ctx)
+	// Every connection the restore opens from here carries its own name, so
+	// the checks for other clients don't count one it has just closed.
+	if own := ctl.OwnApplicationName(); own != "" {
+		if opts.LiveURL, err = WithApplicationName(opts.LiveURL, own); err != nil {
+			return err
+		}
+	}
 	// Step 1.
 	sameDeployment, err := validateForSwap(ctx, src, loader, opts, out)
 	if err != nil {
 		return err
 	}
-	stamp := opts.now().UTC().Format("20060102t150405z")
+	liveOID, found, err := ctl.OID(ctx, live)
+	if err != nil {
+		return fmt.Errorf("reading the live database OID: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("database %s does not exist", live)
+	}
+	// PostgreSQL database names are cluster wide. Include the live database's
+	// OID so restores of different databases can start in the same second.
+	stamp := fmt.Sprintf("%s_%d", opts.now().UTC().Format("20060102t150405z"), liveOID)
 	restored, before := "silo_restore_"+stamp, "silo_before_restore_"+stamp
 	opened, sealedStores, err := openSwapStores(ctx, src, opts, stamp)
 	if err != nil {
@@ -135,10 +157,9 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	}
 	stores := storesOf(opened)
 	// Step 2: preflight. Nothing changes here.
-	liveOID, err := swapPreflight(ctx, ctl, stores, live, restored, before, func() ([]string, error) {
+	if err := swapPreflight(ctx, ctl, stores, live, restored, before, func() ([]string, error) {
 		return loader.Extensions(ctx, src.path(DumpName))
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	// Step 3.
@@ -162,6 +183,14 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err != nil || !found {
 		return discard(fmt.Errorf("reading %s's oid: %w", restored, errors.Join(err, errIf(!found, "not found"))))
 	}
+	// The live server's own settings replace the backup's after the
+	// post-load steps clear what they cannot keep, so those steps do not
+	// report them. Read before the load, so this connection has long ended
+	// when carryLiveState checks the live database is idle.
+	liveOwn, err := loader.ServerSpecificSettingKeys(ctx, opts.LiveURL, opts.Cipher)
+	if err != nil {
+		return discard(fmt.Errorf("reading this server's own settings: %w", err))
+	}
 	_, _ = fmt.Fprintf(out, "Restoring into %s…\n", restored)
 	if err := loader.Load(ctx, restoredURL, src.path(DumpName)); err != nil {
 		return discard(err)
@@ -180,11 +209,12 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 		}
 	}
 	post := newPostLoad(m, opts.Validate, out)
+	post.liveOwn = liveOwn
 	// New signing keys first, so the lost-settings pass does not list them.
 	if err := post.step(stepSigningKeys, rotateSigningSecrets(ctx, loader, restoredURL, opts.Cipher, out)); err != nil {
 		return discard(err)
 	}
-	if err := post.step(stepLostSettings, clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out)); err != nil {
+	if err := post.step(stepLostSettings, clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, post.liveOwn, out)); err != nil {
 		return discard(err)
 	}
 	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, m.CreatedAt, post); err != nil {
@@ -368,45 +398,38 @@ func checkLiveIdle(ctx context.Context, ctl ControlDB, live string) error {
 
 // swapPreflight is §10.2 step 2: no other client on the live database, the
 // privileges a swap needs, free names for the two databases it creates, and
-// writable stores. It changes nothing and returns the live database's oid.
-func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string, extensions func() ([]string, error)) (uint32, error) {
+// writable stores.
+func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string, extensions func() ([]string, error)) error {
 	if others, err := ctl.OtherConnections(ctx, live); err != nil {
-		return 0, fmt.Errorf("checking for other connections: %w", err)
+		return fmt.Errorf("checking for other connections: %w", err)
 	} else if others > 0 {
-		return 0, fmt.Errorf("%d other clients are connected to %s; stop Silo on every server and turn off automatic restarts, or use separate mode (--into)", others, live)
+		return fmt.Errorf("%d other clients are connected to %s; stop Silo on every server and turn off automatic restarts, or use separate mode (--into)", others, live)
 	}
 	if err := ctl.CheckPrivileges(ctx, live); err != nil {
-		return 0, fmt.Errorf("%w; stop here and use separate mode (--into) instead", err)
+		return fmt.Errorf("%w; stop here and use separate mode (--into) instead", err)
 	}
 	// The restored database is new, from template0: pg_restore creates the
 	// backup's extensions in it as this role.
 	needed, err := extensions()
 	if err != nil {
-		return 0, fmt.Errorf("reading the extensions the backup needs: %w", err)
+		return fmt.Errorf("reading the extensions the backup needs: %w", err)
 	}
 	if err := ctl.CheckExtensions(ctx, needed); err != nil {
-		return 0, err
+		return err
 	}
 	for _, name := range []string{restored, before} {
 		if _, taken, err := ctl.OID(ctx, name); err != nil {
-			return 0, err
+			return err
 		} else if taken {
-			return 0, fmt.Errorf("a database named %s already exists; wait a second and run the restore again", name)
+			return fmt.Errorf("a database named %s already exists; wait a second and run the restore again", name)
 		}
-	}
-	liveOID, found, err := ctl.OID(ctx, live)
-	if err != nil {
-		return 0, err
-	}
-	if !found {
-		return 0, fmt.Errorf("database %s does not exist", live)
 	}
 	for name, store := range stores {
 		if err := store.Probe(ctx); err != nil {
-			return 0, fmt.Errorf("the %s blob store is not writable: %w", name, err)
+			return fmt.Errorf("the %s blob store is not writable: %w", name, err)
 		}
 	}
-	return liveOID, nil
+	return nil
 }
 
 func errIf(cond bool, msg string) error {
@@ -780,8 +803,12 @@ func (s *swap) untilState(ctx context.Context, from dbState, act func() error, d
 }
 
 // restoreBlobs undoes every blob the journal records, newest first. Each undo
-// is idempotent, so a rollback that stopped can run again.
+// is idempotent, so a rollback that stopped can run again. Its writes may use
+// a local store's free-space reserve: a restore that stopped at the reserve
+// needs that room to put its preserved files back, and a rollback that stops
+// leaves the databases closed.
 func (s *swap) restoreBlobs(ctx context.Context) error {
+	ctx = blobstore.WithoutFreeSpaceReserve(ctx)
 	blobs := s.j.blobs
 	for i := len(blobs) - 1; i >= 0; i-- {
 		b := blobs[i]

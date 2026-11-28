@@ -240,11 +240,16 @@ func (c MatcherConfig) TVSeriesRootQueueEnabled() bool {
 
 // PlaybackConfig holds transcoding and playback settings.
 type PlaybackConfig struct {
-	FFmpegPath              string `yaml:"ffmpeg_path"`
-	TranscodeDir            string `yaml:"transcode_dir"`
-	SegmentRetentionSeconds int    `yaml:"segment_retention_seconds"`
-	HWAccel                 string `yaml:"hw_accel"`
-	SoftwareFallback        string `yaml:"software_fallback"`
+	// SoftwareFallback is the fork's flag that lets a hardware transcode start
+	// fall back to software when the hardware encoder fails.
+	SoftwareFallback string `yaml:"software_fallback"`
+	// MaxVirtualFailoverAttempts bounds how many alternate virtual sources a
+	// start may rotate through before it fails.
+	MaxVirtualFailoverAttempts int    `yaml:"max_virtual_failover_attempts"`
+	FFmpegPath                 string `yaml:"ffmpeg_path"`
+	TranscodeDir               string `yaml:"transcode_dir"`
+	SegmentRetentionSeconds    int    `yaml:"segment_retention_seconds"`
+	HWAccel                    string `yaml:"hw_accel"`
 	// HWDevice is the GPU render device for hardware transcodes. A single
 	// path pins every GPU workload to that device; a comma-separated list
 	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
@@ -268,13 +273,11 @@ type PlaybackConfig struct {
 	// TrickplayNodeCapacity is how many seek-preview runs one transcode node
 	// admits at once, across every API server that sends it work
 	// (playback.trickplay_node_capacity).
-	TrickplayNodeCapacity      int                   `yaml:"-"`
-	TranscodeEnabled           bool                  `yaml:"transcode_enabled"`
-	Routing                    PlaybackRoutingPolicy `yaml:"-"`
-	MaxVirtualFailoverAttempts int                   `yaml:"max_virtual_failover_attempts"`
+	TrickplayNodeCapacity int                   `yaml:"-"`
+	TranscodeEnabled      bool                  `yaml:"transcode_enabled"`
+	Routing               PlaybackRoutingPolicy `yaml:"-"`
 	// KeyframePlaylist is playback.copy_keyframe_playlist: copy-remux HLS
-	// from one complete keyframe-planned VOD playlist (#1466), which makes
-	// seeking native.
+	// from one complete keyframe-planned playlist (#1466).
 	KeyframePlaylist bool `yaml:"-"`
 	// AutomaticBandwidthProbeOff is playback.bandwidth_probe_automatic turned
 	// off, so a zero config keeps automatic speed tests on.
@@ -602,7 +605,7 @@ const (
 
 // DefaultTranscodeDir is the fallback playback.transcode_dir; download
 // artifacts default to a sibling directory (see EffectiveDownloadArtifactDir).
-const DefaultTranscodeDir = "/tmp/vio-transcode"
+const DefaultTranscodeDir = "/tmp/silo-transcode"
 
 // EffectiveDownloadArtifactDir resolves the shared prepared-download artifact
 // root. Keeping this path rule in config lets API and transcode-node processes
@@ -618,12 +621,12 @@ func EffectiveDownloadArtifactDir(artifactDir, transcodeDir string) string {
 	// "/srv/transcode", which would nest the artifact root INSIDE the transcode
 	// dir — where the orphaned-transcode sweep deletes non-active
 	// subdirectories, i.e. it would delete prepared downloads.
-	return filepath.Join(filepath.Dir(filepath.Clean(transcodeDir)), "vio-download-artifacts")
+	return filepath.Join(filepath.Dir(filepath.Clean(transcodeDir)), "silo-download-artifacts")
 }
 
 const DefaultJellyfinCompatEmulatedServerVersion = "12.1.0"
 const DefaultJellyfinWebVersion = "12.1"
-const DefaultJellyfinWebInstallDir = "/var/lib/vio/compat/jellyfin-web"
+const DefaultJellyfinWebInstallDir = "/var/lib/silo/compat/jellyfin-web"
 const DefaultJellyfinWebDir = DefaultJellyfinWebInstallDir + "/current"
 
 // defaultJellyfinCompatPlaybackSessionTTL matches playback.MaxTokenTTL, the
@@ -690,7 +693,7 @@ func setDefaults() *configRaw {
 			MaxConcurrentScoped:    2,
 			RealtimeMonitoring:     true,
 		},
-		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: DefaultArtworkLocalPath},
+		Artwork: ArtworkConfig{StorageBackend: artworkBackendAuto, LocalPath: "/var/lib/silo/artwork"},
 		Matcher: MatcherConfig{
 			Workers:                 8,
 			BatchSize:               500,
@@ -702,6 +705,7 @@ func setDefaults() *configRaw {
 			SegmentRetentionSeconds:      600,
 			HWAccel:                      "auto",
 			SoftwareFallback:             "allow",
+			MaxVirtualFailoverAttempts:   5,
 			ChapterThumbnailWorkers:      1,
 			ChapterThumbnailExecution:    "local",
 			ChapterThumbnailNodeCapacity: 1,

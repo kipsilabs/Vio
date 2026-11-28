@@ -6,7 +6,7 @@ func TestConfigRejectsUnsafeBindingsAndSampling(t *testing.T) {
 	for _, addr := range []string{"localhost:6060", ":6060", "0.0.0.0:6060", "[::]:6060", "192.0.2.1:6060", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:+6060", "[::1%lo]:6060", "127.0.0.1:pprof", "127.0.0.1:6060 "} {
 		t.Run(addr, func(t *testing.T) {
 			_, err := LoadConfig(func(key string) string {
-				if key == "VIO_DEBUG_LISTEN" || key == "SILO_DEBUG_LISTEN" {
+				if key == "SILO_DEBUG_LISTEN" {
 					return addr
 				}
 				return ""
@@ -18,7 +18,7 @@ func TestConfigRejectsUnsafeBindingsAndSampling(t *testing.T) {
 	}
 	for _, addr := range []string{"", "127.0.0.1:6060", "127.2.3.4:1", "[::1]:65535"} {
 		if _, err := LoadConfig(func(key string) string {
-			if key == "VIO_DEBUG_LISTEN" || key == "SILO_DEBUG_LISTEN" {
+			if key == "SILO_DEBUG_LISTEN" {
 				return addr
 			}
 			return ""
@@ -27,14 +27,11 @@ func TestConfigRejectsUnsafeBindingsAndSampling(t *testing.T) {
 		}
 	}
 	for _, env := range []map[string]string{
-		{"VIO_DEBUG_BLOCK_RATE": "1000000"},
-		{"VIO_DEBUG_LISTEN": "127.0.0.1:6060", "VIO_DEBUG_BLOCK_RATE": "1"},
-		{"VIO_DEBUG_LISTEN": "127.0.0.1:6060", "VIO_DEBUG_MUTEX_FRACTION": "1"},
-		{"VIO_DEBUG_LISTEN": "127.0.0.1:6060", "VIO_DEBUG_MUTEX_FRACTION": "-1"},
-		{"VIO_DEBUG_LISTEN": "127.0.0.1:6060", "VIO_DEBUG_MUTEX_FRACTION": "999999999999999999999"},
 		{"SILO_DEBUG_BLOCK_RATE": "1000000"},
 		{"SILO_DEBUG_LISTEN": "127.0.0.1:6060", "SILO_DEBUG_BLOCK_RATE": "1"},
 		{"SILO_DEBUG_LISTEN": "127.0.0.1:6060", "SILO_DEBUG_MUTEX_FRACTION": "1"},
+		{"SILO_DEBUG_LISTEN": "127.0.0.1:6060", "SILO_DEBUG_MUTEX_FRACTION": "-1"},
+		{"SILO_DEBUG_LISTEN": "127.0.0.1:6060", "SILO_DEBUG_MUTEX_FRACTION": "999999999999999999999"},
 	} {
 		if _, err := LoadConfig(func(key string) string { return env[key] }); err == nil {
 			t.Fatalf("accepted %v", env)

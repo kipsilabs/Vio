@@ -1,25 +1,16 @@
 package metadata
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/s3client"
 )
 
 type artworkRevisionDeleteFunc func(context.Context, []string) (int, error)
@@ -241,123 +232,5 @@ func TestArtworkRevisionGCRunHealsReferencePublishedDuringDelete(t *testing.T) {
 	}
 	if got != source {
 		t.Fatalf("poster_path = %q, want remote source %q", got, source)
-	}
-}
-
-// newArtworkDeleteStore returns a blobstore S3 artwork store whose batch deletes
-// answer every requested key with the given error code.
-func newArtworkDeleteStore(t *testing.T, code string) *blobstore.S3 {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || !r.URL.Query().Has("delete") {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		var request struct {
-			Objects []struct {
-				Key string `xml:"Key"`
-			} `xml:"Object"`
-		}
-		if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Errorf("decode delete request: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		type deleteError struct {
-			Key  string `xml:"Key"`
-			Code string `xml:"Code"`
-		}
-		response := struct {
-			XMLName xml.Name      `xml:"DeleteResult"`
-			Errors  []deleteError `xml:"Error"`
-		}{}
-		for _, object := range request.Objects {
-			response.Errors = append(response.Errors, deleteError{Key: object.Key, Code: code})
-		}
-		_ = xml.NewEncoder(w).Encode(response)
-	}))
-	t.Cleanup(server.Close)
-	return blobstore.NewS3(s3client.NewClient(s3client.BucketConfig{
-		Endpoint: server.URL, Bucket: "artwork", PathStyle: true, AccessKey: "test", SecretKey: "test",
-	}))
-}
-
-func insertDueArtworkGCCandidate(t *testing.T, pool *pgxpool.Pool, path string) {
-	t.Helper()
-	if _, err := pool.Exec(t.Context(), `INSERT INTO artwork_revision_gc_candidates
-   (original_path, object_keys, not_before, next_attempt_at)
-   VALUES ($1, ARRAY[$1]::text[], NOW() - interval '1 hour', NOW() - interval '1 hour')`, path); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DELETE FROM artwork_revision_gc_candidates WHERE original_path = $1`, path)
-	})
-}
-
-// TestArtworkRevisionGCRunTreatsAlreadyDeletedObjectsAsSuccess wires the real
-// S3 artwork store to a server that reports every requested key as NoSuchKey,
-// reproducing the deployed failure. An already-absent object satisfies the
-// cleanup, so the run must succeed, finalize the candidate, and stay quiet.
-func TestArtworkRevisionGCRunTreatsAlreadyDeletedObjectsAsSuccess(t *testing.T) {
-	pool := artworkRevisionGCTestPool(t)
-	ctx := t.Context()
-	path := fmt.Sprintf("tmdb/movies/gc-absent-%d/poster/original.old.webp", time.Now().UnixNano())
-	insertDueArtworkGCCandidate(t, pool, path)
-
-	var logs bytes.Buffer
-	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(previous) })
-
-	stats, err := NewArtworkRevisionGarbageCollector(pool, newArtworkDeleteStore(t, "NoSuchKey")).Run(ctx)
-	if err != nil {
-		t.Fatalf("Run() error = %v, want nil when the objects are already gone", err)
-	}
-	if stats.Deleted != 1 {
-		t.Fatalf("stats = %+v, want one finalized revision", stats)
-	}
-	var remaining int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM artwork_revision_gc_candidates WHERE original_path = $1`, path).Scan(&remaining); err != nil {
-		t.Fatal(err)
-	}
-	if remaining != 0 {
-		t.Fatalf("remaining candidates = %d, want 0 so the retry loop ends", remaining)
-	}
-	if strings.Contains(logs.String(), "partial failure") {
-		t.Fatalf("already-absent object logged a partial-failure warning: %s", logs.String())
-	}
-}
-
-// TestArtworkRevisionGCRunFailsOnGenuineDeleteError keeps a genuinely failing
-// storage error fatal: the task fails, reports the real failure count, and
-// reschedules the candidate instead of treating the key as gone.
-func TestArtworkRevisionGCRunFailsOnGenuineDeleteError(t *testing.T) {
-	pool := artworkRevisionGCTestPool(t)
-	ctx := t.Context()
-	path := fmt.Sprintf("tmdb/movies/gc-denied-%d/poster/original.old.webp", time.Now().UnixNano())
-	insertDueArtworkGCCandidate(t, pool, path)
-
-	stats, err := NewArtworkRevisionGarbageCollector(pool, newArtworkDeleteStore(t, "AccessDenied")).Run(ctx)
-	if err == nil {
-		t.Fatal("Run() error = nil, want a genuine storage failure")
-	}
-	if !strings.Contains(err.Error(), "1 of 1 objects failed") {
-		t.Fatalf("Run() error = %q, want the real failure count", err)
-	}
-	if stats.Claimed != 1 || stats.Retried != 1 {
-		t.Fatalf("stats = %+v, want one claimed and one retried", stats)
-	}
-	var deletedAt, nextAttempt *time.Time
-	var lockedBy, lastError string
-	if err := pool.QueryRow(ctx, `SELECT deleted_at, next_attempt_at, locked_by, last_error
-   FROM artwork_revision_gc_candidates WHERE original_path = $1`, path).
-		Scan(&deletedAt, &nextAttempt, &lockedBy, &lastError); err != nil {
-		t.Fatal(err)
-	}
-	if nextAttempt == nil || !nextAttempt.After(time.Now()) || lockedBy != "" {
-		t.Fatalf("candidate was not rescheduled: next=%v locked_by=%q", nextAttempt, lockedBy)
-	}
-	if !strings.Contains(lastError, "1 of 1 objects failed") {
-		t.Fatalf("candidate last_error = %q, want the real failure count", lastError)
 	}
 }

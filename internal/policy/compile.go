@@ -199,6 +199,3 @@ func compileErrorAt(location *ast.Location, message string) *CompileError {
 	}
 	return &CompileError{Issues: []CompileIssue{issue}}
 }
-func ValidDomain(domain string) bool {
-	return validPolicyDomain(domain)
-}

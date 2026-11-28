@@ -72,8 +72,11 @@ func TestLocalLoginSettingRequiresBreakGlassDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, id) })
-	if rec := putOne(h); rec.Code != http.StatusOK || store.values[key] != "false" {
-		t.Fatalf("with break-glass: %d %s %v", rec.Code, rec.Body.String(), store.values)
+	// A break-glass admin satisfies the password fallback, but upstream also
+	// requires a sign-in provider before local password sign-in may be turned
+	// off. The refusal is a conflict naming that rule, never a 500.
+	if rec := putOne(h); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "sign_in_provider_required") {
+		t.Fatalf("with break-glass and no provider: %d %s %v", rec.Code, rec.Body.String(), store.values)
 	}
 }
 

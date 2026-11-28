@@ -2724,7 +2724,13 @@ export interface AutoscanEventsResponse {
   offset: number;
 }
 
-export type AutoscanScanStatus = "accepted" | "running" | "completed" | "failed" | "canceled";
+export type AutoscanScanStatus =
+  | "accepted"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "canceled";
 
 export interface AutoscanScan {
   id: string;
