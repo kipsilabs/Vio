@@ -94,6 +94,10 @@ var signInRowWriters = map[string]string{
 	"internal/auth/session.go:RevokeAllByUser":                    unused,
 	"internal/auth/session.go:RevokeAllByImpersonator":            unused,
 	"internal/userstore/pgstore/profiles.go:DeleteProfileAudited": knownGap,
+
+	// The scenario executor seeds a scratch database between scenarios; no
+	// plugin uninstall runs while it truncates and recreates the fixtures.
+	"internal/scenariocatalog/executor/env.go:Reseed": "scratch database, no concurrent uninstall",
 }
 
 // signInRowWrite matches SQL that writes the tables, allowing a schema and
