@@ -94,11 +94,17 @@ func TestDirectoriesReadsOnlyTheScannedSubtreeDB(t *testing.T) {
 		}
 		defer conn.Release()
 		subtree, _ := directoriesQuery(folderID, show+"/Season 1")
-		for _, tc := range []struct{ query, index, cond string }{
-			{subtree, "idx_media_files_folder_file_path_pattern", "file_path ~>=~"},
-			{scopeRootsQuery, "idx_media_files_folder_root", "canonical_root_path"},
+		for _, tc := range []struct {
+			query   string
+			indexes []string
+			cond    string
+		}{
+			// Either path index bounds the scanned subtree; which one the
+			// generic plan picks depends on the statistics.
+			{subtree, []string{"idx_media_files_folder_file_path_pattern", "idx_media_files_file_path_pattern"}, "file_path ~>=~"},
+			{scopeRootsQuery, []string{"idx_media_files_folder_root"}, "canonical_root_path"},
 		} {
-			assertIndexedGenericPlan(t, conn.Conn().PgConn(), tc.query, tc.index, tc.cond)
+			assertIndexedGenericPlan(t, conn.Conn().PgConn(), tc.query, tc.indexes, tc.cond)
 		}
 	})
 }
@@ -165,7 +171,7 @@ func TestResolveFindsThemesInOneOfAnItemsFoldersDB(t *testing.T) {
 // assertIndexedGenericPlan fails unless the generic plan of query bounds cond on
 // index and never reads media_files sequentially. pgx prepares statements, and
 // PostgreSQL may switch them to a generic plan after five executions.
-func assertIndexedGenericPlan(t *testing.T, conn *pgconn.PgConn, query, index, cond string) {
+func assertIndexedGenericPlan(t *testing.T, conn *pgconn.PgConn, query string, indexes []string, cond string) {
 	t.Helper()
 	// GENERIC_PLAN needs the simple query protocol to leave $n unbound.
 	results, err := conn.Exec(t.Context(), `EXPLAIN (GENERIC_PLAN, FORMAT JSON) `+query).ReadAll()
@@ -184,12 +190,12 @@ func assertIndexedGenericPlan(t *testing.T, conn *pgconn.PgConn, query, index, c
 		if node.RelationName == "media_files" && node.NodeType == "Seq Scan" {
 			t.Errorf("generic plan reads media_files sequentially: %s", raw)
 		}
-		if node.IndexName == index && strings.Contains(node.IndexCond, cond) {
+		if slices.Contains(indexes, node.IndexName) && strings.Contains(node.IndexCond, cond) {
 			indexed = true
 		}
 	})
 	if !indexed {
-		t.Errorf("generic plan does not bound %s on %s: %s", cond, index, raw)
+		t.Errorf("generic plan does not bound %s on %s: %s", cond, strings.Join(indexes, " or "), raw)
 	}
 }
 
