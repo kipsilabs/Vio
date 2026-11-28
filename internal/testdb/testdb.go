@@ -116,7 +116,10 @@ func isDisposableBaseName(name string) bool {
 	// clone a test binary is handed is disposable by construction even when
 	// the template's name carries no marker.
 	return strings.HasPrefix(lower, "dbpins_") ||
-		strings.Contains(lower, "test") || strings.Contains(lower, "purge")
+		strings.Contains(lower, "test") || strings.Contains(lower, "purge") ||
+		// The trusted CI integration job starts its disposable PG17
+		// database under this fixed name.
+		lower == "watch_party"
 }
 
 func disposableName(base, tag string) (string, error) {
