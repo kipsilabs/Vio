@@ -133,17 +133,17 @@ func TestHandlerRecordsErrorText(t *testing.T) {
 
 type nilPtrError struct{ msg string }
 
-func (e *nilPtrErr) Error() string { return e.msg }
+func (e *nilPtrError) Error() string { return e.msg }
 
 // TestHandlerRecordsTypedNilError checks that a nil pointer satisfying error
 // is recorded instead of panicking when Error dereferences the receiver.
 func TestHandlerRecordsTypedNilError(t *testing.T) {
 	t.Parallel()
 	entry := logEntry(t, func(logger *slog.Logger) {
-		var err *nilPtrErr
+		var err *nilPtrError
 		logger.ErrorContext(context.Background(), "probe: error", "error", err)
 	})
-	if got := entry.Attrs["error"]; got != "<nil *opslog.nilPtrErr>" {
+	if got := entry.Attrs["error"]; got != "<nil *opslog.nilPtrError>" {
 		t.Fatalf("attrs[error] = %#v, want a nil placeholder", got)
 	}
 }
