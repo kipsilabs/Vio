@@ -253,6 +253,8 @@ var restoredFlagColumns = map[string]string{
 	"request_settings.id":                                     whyKey,
 	"series_root_match_queue.lease_forced_rerun":              whyQueue,
 	"series_root_match_queue.rerun_requested":                 whyQueue,
+	"user_device_profiles.dolby_vision":                       whyFacts,
+	"user_device_profiles.hdr":                                whyFacts,
 	"user_downloads.transcoded":                               whyFacts,
 	"user_library_playback_preferences.show_forced_subtitles": whyPlayback,
 	"user_login_identifiers.legacy_duplicate":                 whyMigration,
