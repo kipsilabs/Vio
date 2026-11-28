@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -49,7 +50,7 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 	// watch_party, while its pgvector database (silo_test) sits beside it.
 	// Clone the pgvector one; a clone of the plain database cannot apply the
 	// schema.
-	if sibling, ok := pgvectorSiblingDSN(baseCfg); ok {
+	if sibling, ok := pgvectorSiblingDSN(baseCfg, baseDSN); ok {
 		baseDSN = sibling
 		if baseCfg, err = pgxpool.ParseConfig(baseDSN); err != nil {
 			log.Print("testdb: parse pgvector sibling DSN failed")
@@ -125,13 +126,21 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 // a plain watch_party database: same host and credentials, port 5433, database
 // silo_test. ok is false when the sibling is absent, unmigrated or has no
 // vector extension.
-func pgvectorSiblingDSN(base *pgxpool.Config) (string, bool) {
+func pgvectorSiblingDSN(base *pgxpool.Config, baseDSN string) (string, bool) {
 	if !strings.EqualFold(base.ConnConfig.Database, "watch_party") {
 		return "", false
 	}
-	cfg := base.Copy()
-	cfg.ConnConfig.Port = 5433
-	cfg.ConnConfig.Database = "silo_test"
+	u, err := url.Parse(baseDSN)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return "", false
+	}
+	u.Host = net.JoinHostPort(u.Hostname(), "5433")
+	u.Path = "/silo_test"
+	dsn := u.String()
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return "", false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -144,7 +153,7 @@ func pgvectorSiblingDSN(base *pgxpool.Config) (string, bool) {
 		AND EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')`).Scan(&ready); err != nil || !ready {
 		return "", false
 	}
-	return cfg.ConnString(), true
+	return dsn, true
 }
 
 func isDisposableBaseName(name string) bool {
