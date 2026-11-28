@@ -197,11 +197,15 @@ func TestEpisodesAboveQualityCeilingStayHiddenPostgres(t *testing.T) {
 		// adjacent is Jellyfin's AdjacentTo window around E1: a hidden E2
 		// drops out rather than giving way to E3.
 		adjacent []string
-		recent   []string // the first library's row, where E2 arrived in 4K
+		// recent is the first library's event row, where E2 arrived in 4K.
+		// The event list is cached without the viewing profile's ceiling
+		// (RecentTVQuery.PlayContentID), so the arrival row stays and the
+		// play-target resolver applies the ceiling later.
+		recent []string
 	}{
 		{"no ceiling", AccessFilter{}, episode(2), startedEpisode, all, all[:2], []string{episode(2), series}},
-		{"1080p ceiling", AccessFilter{MaxPlaybackQuality: "1080p", DisabledLibraryIDs: []int{other}}, "", "", []string{episode(1), episode(3), episode(4)}, all[:1], []string{series}},
-		{"1080p ceiling with the 1080p library", AccessFilter{MaxPlaybackQuality: "1080p"}, episode(2), "", all, all[:2], []string{series}},
+		{"1080p ceiling", AccessFilter{MaxPlaybackQuality: "1080p", DisabledLibraryIDs: []int{other}}, "", "", []string{episode(1), episode(3), episode(4)}, all[:1], []string{episode(2), series}},
+		{"1080p ceiling with the 1080p library", AccessFilter{MaxPlaybackQuality: "1080p"}, episode(2), "", all, all[:2], []string{episode(2), series}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := NewNextUpRepository(f.pool, pgstore.NewPostgresProvider(f.pool))
