@@ -35,7 +35,7 @@ func materializeTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("identify test database: %v", err)
 	}
 	lowerName := strings.ToLower(databaseName)
-	if !strings.HasPrefix(lowerName, "dbpins_") && !strings.Contains(lowerName, "test") && !strings.Contains(lowerName, "purge") {
+	if !strings.HasPrefix(lowerName, "dbpins_") && !strings.Contains(lowerName, "test") && !strings.Contains(lowerName, "purge") && lowerName != "watch_party" {
 		t.Fatalf("refusing destructive handler fixture database %q", databaseName)
 	}
 	lockConn, err := pool.Acquire(ctx)

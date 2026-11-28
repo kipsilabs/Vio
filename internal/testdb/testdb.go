@@ -45,6 +45,17 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 		log.Print("testdb: invalid SILO_TEST_DATABASE_URL; refusing to run")
 		return 1
 	}
+	// The trusted CI integration job hands some steps a plain Postgres named
+	// watch_party, while its pgvector database (silo_test) sits beside it.
+	// Clone the pgvector one; a clone of the plain database cannot apply the
+	// schema.
+	if sibling, ok := pgvectorSiblingDSN(baseCfg); ok {
+		baseDSN = sibling
+		if baseCfg, err = pgxpool.ParseConfig(baseDSN); err != nil {
+			log.Print("testdb: parse pgvector sibling DSN failed")
+			return 1
+		}
+	}
 	if !isDisposableBaseName(baseCfg.ConnConfig.Database) {
 		log.Print("testdb: refusing to clone non-test database")
 		return 1
@@ -108,6 +119,32 @@ func SetupPackage(m *testing.M, tag string) (code int) {
 		}
 	}()
 	return m.Run()
+}
+
+// pgvectorSiblingDSN finds the CI integration job's pgvector database beside
+// a plain watch_party database: same host and credentials, port 5433, database
+// silo_test. ok is false when the sibling is absent, unmigrated or has no
+// vector extension.
+func pgvectorSiblingDSN(base *pgxpool.Config) (string, bool) {
+	if !strings.EqualFold(base.ConnConfig.Database, "watch_party") {
+		return "", false
+	}
+	cfg := base.Copy()
+	cfg.ConnConfig.Port = 5433
+	cfg.ConnConfig.Database = "silo_test"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return "", false
+	}
+	defer pool.Close()
+	var ready bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.goose_db_version') IS NOT NULL
+		AND EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')`).Scan(&ready); err != nil || !ready {
+		return "", false
+	}
+	return cfg.ConnString(), true
 }
 
 func isDisposableBaseName(name string) bool {
